@@ -47,7 +47,29 @@ CREATE TABLE IF NOT EXISTS mutes (
 CREATE TABLE IF NOT EXISTS devices (
     device TEXT PRIMARY KEY, last_success REAL, last_error TEXT, last_error_at REAL, info TEXT
 );
+CREATE TABLE IF NOT EXISTS subscribers (
+    chat_id TEXT PRIMARY KEY, name TEXT, role TEXT NOT NULL, level TEXT NOT NULL, created REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS personal_mutes (
+    chat_id TEXT NOT NULL, target TEXT NOT NULL, until REAL, created REAL NOT NULL,
+    PRIMARY KEY (chat_id, target)
+);
 """
+
+
+def mute_matches(target: str, device: str, rule_id: str = "", category: str | None = None) -> bool:
+    """Does a mute target cover this alert?
+
+    Targets (case-insensitive): "*" (everything), a device ("Flash"), an alarm category
+    ("anomaly", "pumps"...), a device + category ("Flash/anomaly") or a rule id
+    ("Flash/T4K above 5 K").
+    """
+    t = target.strip().lower()
+    dev = device.lower()
+    cands = {"*", dev, rule_id.lower()}
+    if category:
+        cands |= {category.lower(), f"{dev}/{category.lower()}"}
+    return t in cands
 
 
 @dataclass
@@ -57,8 +79,19 @@ class Mute:
     reason: str
     created: float
 
-    def matches(self, device: str, rule_id: str) -> bool:
-        return self.target in ("*", device, rule_id)
+    def matches(self, device: str, rule_id: str, category: str | None = None) -> bool:
+        return mute_matches(self.target, device, rule_id, category)
+
+
+@dataclass
+class Subscriber:
+    """A Telegram chat that receives alerts (a person or a group)."""
+
+    chat_id: str
+    name: str
+    role: str  # "admin" | "user" | "pending"
+    level: str  # minimum severity this person wants: info / warning / critical
+    created: float
 
 
 class StateStore:
@@ -131,6 +164,7 @@ class StateStore:
             self.db.execute("DELETE FROM readings WHERE ts < ?", (now - history_days * 86400,))
             self.db.execute("DELETE FROM events WHERE ts < ?", (now - events_days * 86400,))
             self.db.execute("DELETE FROM mutes WHERE until IS NOT NULL AND until < ?", (now,))
+            self.db.execute("DELETE FROM personal_mutes WHERE until IS NOT NULL AND until < ?", (now,))
 
     # -- devices ----------------------------------------------------------
 
@@ -196,7 +230,7 @@ class StateStore:
 
     def unmute(self, target: str) -> bool:
         with self.db:
-            cur = self.db.execute("DELETE FROM mutes WHERE target=?", (target,))
+            cur = self.db.execute("DELETE FROM mutes WHERE lower(target)=lower(?)", (target,))
         return cur.rowcount > 0
 
     def mutes(self, now: float | None = None) -> list[Mute]:
@@ -205,3 +239,50 @@ class StateStore:
             "SELECT * FROM mutes WHERE until IS NULL OR until > ? ORDER BY created", (now,)
         ).fetchall()
         return [Mute(r["target"], r["until"], r["reason"] or "", r["created"]) for r in rows]
+
+    # -- subscribers (Telegram users) ---------------------------------------------
+
+    def subscriber(self, chat_id: str | int) -> Subscriber | None:
+        r = self.db.execute("SELECT * FROM subscribers WHERE chat_id=?", (str(chat_id),)).fetchone()
+        return Subscriber(r["chat_id"], r["name"] or "", r["role"], r["level"], r["created"]) if r else None
+
+    def subscribers(self, roles: tuple[str, ...] = ("admin", "user")) -> list[Subscriber]:
+        q = f"SELECT * FROM subscribers WHERE role IN ({','.join('?' * len(roles))}) ORDER BY created"
+        return [Subscriber(r["chat_id"], r["name"] or "", r["role"], r["level"], r["created"])
+                for r in self.db.execute(q, roles)]
+
+    def upsert_subscriber(self, chat_id: str | int, name: str, role: str, level: str) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO subscribers VALUES (?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET "
+                "name=excluded.name, role=excluded.role, level=excluded.level",
+                (str(chat_id), name, role, level, time.time()),
+            )
+
+    def remove_subscriber(self, chat_id: str | int) -> bool:
+        with self.db:
+            cur = self.db.execute("DELETE FROM subscribers WHERE chat_id=?", (str(chat_id),))
+            self.db.execute("DELETE FROM personal_mutes WHERE chat_id=?", (str(chat_id),))
+        return cur.rowcount > 0
+
+    def personal_mute(self, chat_id: str | int, target: str, until: float | None) -> None:
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO personal_mutes VALUES (?,?,?,?)",
+                            (str(chat_id), target.strip().lower(), until, time.time()))
+
+    def personal_unmute(self, chat_id: str | int, target: str) -> int:
+        with self.db:
+            if target.strip().lower() == "all":
+                cur = self.db.execute("DELETE FROM personal_mutes WHERE chat_id=?", (str(chat_id),))
+            else:
+                cur = self.db.execute("DELETE FROM personal_mutes WHERE chat_id=? AND target=?",
+                                      (str(chat_id), target.strip().lower()))
+        return cur.rowcount
+
+    def personal_mutes(self, chat_id: str | int, now: float | None = None) -> list[Mute]:
+        now = time.time() if now is None else now
+        rows = self.db.execute(
+            "SELECT * FROM personal_mutes WHERE chat_id=? AND (until IS NULL OR until > ?) ORDER BY created",
+            (str(chat_id), now),
+        ).fetchall()
+        return [Mute(r["target"], r["until"], "", r["created"]) for r in rows]

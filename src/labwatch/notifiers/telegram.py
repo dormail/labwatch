@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import html
-from typing import Any
+import logging
+from dataclasses import dataclass
+from typing import Any, Callable
 
 from labwatch.models import AlertEvent, EventKind, Severity
 from labwatch.notifiers._common import ConfigReader, HttpNotifier, is_urgent
 from labwatch.notifiers.base import register
 
 DEFAULT_API_BASE = "https://api.telegram.org"
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Recipient:
+    chat_id: str | int
+    silent: bool
 
 
 @register("telegram")
@@ -79,8 +89,22 @@ class TelegramNotifier(HttpNotifier):
             **http,
         )
 
+    # Set by the Telegram command bot when several people subscribe: returns who gets
+    # an event (each with their own level and mutes). None = just chat_id.
+    recipients_fn: Callable[[AlertEvent], list[Recipient]] | None = None
+
     def _secrets(self) -> list[str | None]:
         return [self._bot_token]
+
+    def accepts(self, event: AlertEvent) -> bool:
+        if self.recipients_fn is not None:
+            return True  # filtered per person in recipients()
+        return super().accepts(event)
+
+    def recipients(self, event: AlertEvent) -> list[Recipient]:
+        if self.recipients_fn is not None:
+            return self.recipients_fn(event)
+        return [Recipient(self.target_chat(event), self.is_silent(event))]
 
     def target_chat(self, event: AlertEvent) -> str | int:
         if self.critical_chat_id is not None and is_urgent(event):
@@ -101,17 +125,30 @@ class TelegramNotifier(HttpNotifier):
             text += "\n" + html.escape(message)
         return text
 
-    def build_payload(self, event: AlertEvent) -> dict[str, Any]:
+    def build_payload(self, event: AlertEvent, recipient: Recipient | None = None) -> dict[str, Any]:
+        r = recipient or Recipient(self.target_chat(event), self.is_silent(event))
         return {
-            "chat_id": self.target_chat(event),
+            "chat_id": r.chat_id,
             "text": self.format_text(event),
             "parse_mode": "HTML",
-            "disable_notification": self.is_silent(event),
+            "disable_notification": r.silent,
         }
 
     async def send(self, event: AlertEvent) -> None:
+        recipients = self.recipients(event)
+        failures: list[Exception] = []
+        for r in recipients:
+            try:
+                await self._send_to(event, r)
+            except Exception as e:  # noqa: BLE001 - one blocked/broken chat must not stop the others
+                failures.append(e)
+                log.warning("telegram: delivery to chat %s failed: %s", r.chat_id, e)
+        if failures and len(failures) == len(recipients):
+            raise failures[0]
+
+    async def _send_to(self, event: AlertEvent, recipient: Recipient) -> None:
         url = f"{self.api_base}/bot{self._bot_token}/sendMessage"
-        resp = await self._post(url, json=self.build_payload(event))
+        resp = await self._post(url, json=self.build_payload(event, recipient))
         try:
             data = resp.json()
         except ValueError:

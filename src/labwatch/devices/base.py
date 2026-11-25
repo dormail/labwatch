@@ -80,6 +80,10 @@ class Device(abc.ABC):
     # Default `steady_state` gate (see labwatch.rules.SteadyState); None = no gate.
     default_steady_state: dict | None = None
 
+    def category_for(self, channel: str) -> str:
+        """Alarm type of a channel ("temperature", "pumps", ...), used for muting by type."""
+        return "other"
+
     @property
     def status_sections(self) -> list[tuple[str, tuple[str, ...]]]:
         """(heading, channels) groups for a detailed status report."""

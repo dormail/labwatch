@@ -111,6 +111,7 @@ class Monitor:
         self._tasks: list[asyncio.Task] = []
         self._device_tasks: list[asyncio.Task] = []
         self._dispatching = 0
+        self._known_mutes: dict | None = None
 
     # -- construction ------------------------------------------------------
 
@@ -165,22 +166,38 @@ class Monitor:
             t = asyncio.create_task(self._device_loop(rt), name=f"poll:{rt.name}")
             self._device_tasks.append(t)
         self._tasks.extend(self._device_tasks)
+        # Helpers run supervised: if one crashes it's restarted; it can't stop the monitoring.
         if self.config.heartbeat_url:
-            self._tasks.append(asyncio.create_task(self._heartbeat_loop(), name="heartbeat"))
+            self._supervise("heartbeat", self._heartbeat_loop)
         if self.config.daily_summary:
-            self._tasks.append(asyncio.create_task(self._daily_summary_loop(), name="summary"))
-        self._tasks.append(asyncio.create_task(self._maintenance_loop(), name="maintenance"))
+            self._supervise("summary", self._daily_summary_loop)
+        self._supervise("maintenance", self._maintenance_loop)
+        self._supervise("mutes", self._mute_watch_loop)
         for bot in self.command_bots():
-            self._tasks.append(asyncio.create_task(bot.run(), name="telegram-commands"))
+            self._supervise(f"commands:{type(bot).__name__}", bot.run)
 
         if self.config.notify_startup:
             names = ", ".join(f"{rt.name} ({len(rt.rules)} rules)" for rt in self.runtimes)
             self.emit(AlertEvent(EventKind.INFO, "labwatch/startup", "labwatch",
-                                 "labwatch started", f"Monitoring: {names}", Severity.INFO))
+                                 "labwatch started", f"Monitoring: {names}", Severity.INFO, category="labwatch"))
         try:
             await asyncio.gather(*self._tasks)
         finally:
             await self.shutdown()
+
+    def _supervise(self, name: str, factory) -> None:
+        async def runner() -> None:
+            while True:
+                try:
+                    await factory()
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    log.exception("%s crashed; restarting in 30 s", name)
+                    await asyncio.sleep(30)
+
+        self._tasks.append(asyncio.create_task(runner(), name=name))
 
     def command_bots(self) -> list:
         """Telegram command listeners for Telegram notifiers with ``commands: true`` (one per bot)."""
@@ -202,7 +219,8 @@ class Monitor:
         # Best effort: tell humans monitoring stopped, and flush what's queued.
         if self.config.notify_startup and self.notifiers:
             ev = AlertEvent(EventKind.INFO, "labwatch/shutdown", "labwatch", "labwatch stopped",
-                            "Monitoring is OFF until labwatch is started again.", Severity.INFO)
+                            "Monitoring is OFF until labwatch is started again.", Severity.INFO,
+                            category="labwatch")
             self._queue.put_nowait(ev)
         while not self._queue.empty():
             ev = self._queue.get_nowait()
@@ -256,7 +274,10 @@ class Monitor:
         for r in readings:
             rt.latest[r.channel] = r
             rt.history.add(r, now)
-        readings = [*readings, *rt.add_computed(now)]
+        try:
+            readings = [*readings, *rt.add_computed(now)]
+        except Exception:  # noqa: BLE001 - never let a computed channel stop the rules
+            log.exception("%s: computing derived channels failed", rt.name)
         self.store.save_readings(readings, now)
         self.store.device_ok(rt.name, now)
         return self.evaluate(rt, now)
@@ -285,7 +306,8 @@ class Monitor:
                 # New alert, or an alert that started while muted and is still active.
                 st.delivered = True
                 st.last_notified = now
-                events.append(self._make_event(rt, rule, EventKind.FIRING, verdict.detail, now))
+                detail = verdict.detail if verdict.active is not None else st.last_detail
+                events.append(self._make_event(rt, rule, EventKind.FIRING, detail, now))
             elif tr == Transition.REMINDER and not muted:
                 events.append(self._make_event(rt, rule, EventKind.REMINDER, verdict.detail, now))
             elif tr == Transition.RESOLVED and not muted:
@@ -295,6 +317,7 @@ class Monitor:
             events.append(AlertEvent(
                 EventKind.INFO, f"{rt.name}/armed", rt.name, f"{rt.name}: alarms armed",
                 f"These alarms are now active:\n{lines}\n\nNow: {rt.snapshot()}", Severity.INFO,
+                category="labwatch",
             ))
         self._save_state()
         for ev in events:
@@ -339,6 +362,7 @@ class Monitor:
             value=st.last_value,
             unit=spec.unit if spec else None,
             since=datetime.fromtimestamp(since).astimezone() if since else None,
+            category=rule.category,
         )
 
     # -- notification dispatch ---------------------------------------------------
@@ -440,7 +464,44 @@ class Monitor:
             lines.append("Muted: " + ", ".join(
                 f"{m.target}" + (f" until {fmt_time(m.until)}" if m.until else "") for m in mutes))
         return AlertEvent(EventKind.INFO, "labwatch/summary", "labwatch", "labwatch daily summary",
-                          "\n".join(lines), Severity.INFO)
+                          "\n".join(lines), Severity.INFO, category="labwatch")
+
+    def check_mute_changes(self, now: float | None = None) -> list[AlertEvent]:
+        """Announce mutes for everyone (from the CLI or Telegram /muteall) to all notifiers."""
+        now = time.time() if now is None else now
+        current = {m.target.lower(): m for m in self.store.mutes(now)}
+        if self._known_mutes is None:  # first call: just remember what's there
+            self._known_mutes = current
+            return []
+        events = []
+        for key, m in current.items():
+            old = self._known_mutes.get(key)
+            if old is None or old.until != m.until:
+                until = f"until {fmt_time(m.until)}" if m.until else "until unmuted"
+                reason = f" ({m.reason})" if m.reason else ""
+                events.append(AlertEvent(
+                    EventKind.INFO, "labwatch/mute", "labwatch", f"🔕 {m.target} muted for everyone",
+                    f"Alerts for {m.target!r} are muted for everyone {until}{reason}.\n"
+                    f"Undo: /unmuteall {m.target}", Severity.INFO, category="labwatch"))
+        for key, m in self._known_mutes.items():
+            if key not in current:
+                expired = m.until is not None and m.until <= now
+                events.append(AlertEvent(
+                    EventKind.INFO, "labwatch/mute", "labwatch", f"🔔 {m.target} unmuted",
+                    f"Alerts for {m.target!r} are active again" + (" (mute expired)." if expired else "."),
+                    Severity.INFO, category="labwatch"))
+        self._known_mutes = current
+        for ev in events:
+            self.emit(ev)
+        return events
+
+    async def _mute_watch_loop(self) -> None:
+        while True:
+            try:
+                self.check_mute_changes()
+            except Exception:  # noqa: BLE001
+                log.exception("checking mutes failed")
+            await asyncio.sleep(15)
 
     async def _maintenance_loop(self) -> None:
         while True:
@@ -459,6 +520,7 @@ def build_runtime(config: Config, sec) -> DeviceRuntime:
     unreach_cfg = {
         "severity": sec.cfg.get("unreachable_severity", "critical"),
         "auto_arm": False,
+        "steady_only": False,  # a dead control PC matters during cooldowns too
         "for": 0,  # unreachable_after already is the debounce
         "clear_for": 0,
         "message": sec.cfg.get(
@@ -479,7 +541,12 @@ def build_runtime(config: Config, sec) -> DeviceRuntime:
         steady_cfg = None
     steady = SteadyState.from_config(device.name, steady_cfg, device.channels) if steady_cfg else None
     # Keep enough in-memory history for the longest rule window and the steady-state gate.
-    keep = max([3600.0, *(r.horizon for r in rules), steady.for_s if steady else 0.0]) + 3600.0
+    # The gate needs its own `for` on top of the longest baseline, or "steady since" would
+    # slide with the trimmed history and short baselines would never finish learning.
+    keep = max([3600.0, *(r.horizon for r in rules)]) + (steady.for_s if steady else 0.0) + 3600.0
+    for r in rules:
+        if not r.opts.category and r.default_category == "other":
+            r.category = device.category_for(r.channel)
     for r in rules:
         if r.rule_id == unreachable.rule_id:
             raise RuleConfigError(
@@ -490,8 +557,8 @@ def build_runtime(config: Config, sec) -> DeviceRuntime:
 
 
 def _muted_by(mutes: list[Mute], rule: Rule) -> bool:
-    return any(m.matches(rule.device, rule.rule_id) for m in mutes)
+    return any(m.matches(rule.device, rule.rule_id, rule.category) for m in mutes)
 
 
 def _muted_device(mutes: list[Mute], device: str) -> bool:
-    return any(m.target in ("*", device) for m in mutes)
+    return any(m.target.lower() in ("*", device.lower()) for m in mutes)

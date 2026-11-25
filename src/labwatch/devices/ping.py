@@ -48,6 +48,9 @@ class PingDevice(Device):
     def status_sections(self) -> list[tuple[str, tuple[str, ...]]]:
         return [("Network", ("reachable", "rtt_ms"))]
 
+    def category_for(self, channel: str) -> str:
+        return "connection"
+
     def __init__(
         self,
         name: str,

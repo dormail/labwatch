@@ -21,7 +21,13 @@ import time
 from typing import Any
 
 from labwatch.devices.base import ChannelSpec, Device, DeviceUnreachable, register
-from labwatch.devices.bluefors import BLUEFORS_STEADY_STATE, DEFAULT_CHANNELS, STATUS_SECTIONS, SUMMARY_CHANNELS
+from labwatch.devices.bluefors import (
+    BLUEFORS_STEADY_STATE,
+    DEFAULT_CHANNELS,
+    STATUS_SECTIONS,
+    SUMMARY_CHANNELS,
+    bluefors_category,
+)
 from labwatch.models import Reading, parse_duration, utcnow
 
 BASE = {
@@ -54,6 +60,9 @@ class SimulatedDevice(Device):
     summary_channels = SUMMARY_CHANNELS
     overview_channels = ("T4K", "TMXC", "pulse_tube")
     default_steady_state = BLUEFORS_STEADY_STATE
+
+    def category_for(self, channel: str) -> str:
+        return bluefors_category(channel)
 
     @property
     def status_sections(self) -> list[tuple[str, tuple[str, ...]]]:

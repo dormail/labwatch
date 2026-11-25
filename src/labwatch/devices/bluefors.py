@@ -229,6 +229,24 @@ BLUEFORS_STEADY_STATE = {
     "for": "6h",
 }
 
+def bluefors_category(channel: str) -> str:
+    """Alarm types users can mute separately (e.g. `/mute anomaly`)."""
+    c = channel.lower()
+    if c.startswith("fse_") or c == "t_fse":
+        return "fse"
+    if c in ("t50k", "t4k", "tstill", "tmxc"):
+        return "temperature"
+    if c.startswith("cooling_water"):
+        return "cooling_water"
+    if c in ("pulse_tube", "compressor") or c.startswith("cpa_"):
+        return "pulse_tube"
+    if c in ("flow", "ghs_compressor") or c.startswith(("scroll", "turbo", "tc400")):
+        return "circulation"
+    if len(c) == 2 and c[0] == "p" and c[1].isdigit():
+        return "pressure"
+    return "other"
+
+
 # Channels shown in every alert message, to give the full picture at a glance.
 SUMMARY_CHANNELS = ("T50K", "T4K", "Tstill", "TMXC", "pulse_tube", "compressor", "flow", "cooling_water_in")
 
@@ -246,6 +264,10 @@ class BlueforsDevice(Device):
     @property
     def status_sections(self) -> list[tuple[str, tuple[str, ...]]]:
         return [(title, tuple(c for c in chans if c in self.channels)) for title, chans in STATUS_SECTIONS]
+
+    def category_for(self, channel: str) -> str:
+        return bluefors_category(channel)
+
     def __init__(
         self,
         name: str,

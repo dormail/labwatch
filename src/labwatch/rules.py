@@ -153,6 +153,7 @@ class RuleOptions:
     detail_channel: str | None = None  # append this channel's text (e.g. alarm text)
     on_invalid: str = "ignore"  # "alarm": an unreadable value (DISCONNECTED, INVALID) counts as a problem
     steady_only: bool = False  # only arm/fire while the device is in its steady state (not cooling down)
+    category: str | None = None  # alarm type for muting; default: derived from the channel
 
 
 class Rule(abc.ABC):
@@ -165,6 +166,10 @@ class Rule(abc.ABC):
         self.name = name or f"{channel} {self.describe()}"
         self.rule_id = f"{device}/{self.name}"
         self.state = RuleState(armed=not opts.auto_arm)
+        # Alarm type ("temperature", "pumps", "anomaly", ...), set by the engine from the device.
+        self.category: str = opts.category or self.default_category
+
+    default_category = "other"
 
     # -- to implement ---------------------------------------------------------
 
@@ -390,6 +395,7 @@ class UnreachableRule(Rule):
     """Built-in per-device rule: polling has failed for ``unreachable_after`` seconds."""
 
     kind = "unreachable"
+    default_category = "connection"
 
     def __init__(self, device: str, after: float, opts: RuleOptions) -> None:
         self.after = after
@@ -436,6 +442,7 @@ class DeviationRule(Rule):
     """
 
     kind = "deviation"
+    default_category = "anomaly"
 
     def __init__(self, device, channel, name, opts, deviation, baseline=86400.0, exclude_recent=3600.0,
                  noise_factor=4.0, min_baseline=None, unit=None):
@@ -536,11 +543,17 @@ class SteadyState:
         since = float("-inf")
         for c in self.conditions:
             r = readings.get(c.channel)
-            if r is None or r.value is None:
-                return False, None, f"{c.channel} unavailable"
-            if not c.ok(r.value):
-                return False, None, f"{c.channel} = {r.format_value()} (steady needs {c.describe(self.units.get(c.channel))})"
             pts = history.points(c.channel)
+            if r is None or r.value is None:
+                # A single invalid reading shouldn't reset the gate: use the last good value
+                # if it's recent (invalid readings aren't stored in the history).
+                if not pts or now - pts[-1][0] > 1800:
+                    return False, None, f"{c.channel} unavailable"
+                value, shown = pts[-1][1], f"{pts[-1][1]:g} (last valid)"
+            else:
+                value, shown = r.value, r.format_value()
+            if not c.ok(value):
+                return False, None, f"{c.channel} = {shown} (steady needs {c.describe(self.units.get(c.channel))})"
             ok_since = pts[0][0] if pts else now
             for t, v in reversed(pts):
                 if not c.ok(v):
@@ -571,7 +584,7 @@ def _as_float_set(v: Any) -> set[float]:
 
 _OPTION_KEYS = {
     "severity", "for", "clear_for", "auto_arm", "arm_after", "repeat_interval", "message", "detail_channel",
-    "on_invalid", "steady_only",
+    "on_invalid", "steady_only", "category",
 }
 _KIND_KEYS = {
     "threshold": {"above", "below", "hysteresis"},
@@ -609,6 +622,8 @@ def build_options(cfg: dict[str, Any], defaults: dict[str, Any]) -> RuleOptions:
         raise ValueError(f"on_invalid must be 'ignore' or 'alarm', got {o.on_invalid!r}")
     if "steady_only" in merged:
         o.steady_only = bool(merged["steady_only"])
+    if merged.get("category"):
+        o.category = str(merged["category"]).strip().lower()
     o.message = str(merged.get("message") or "")
     o.detail_channel = merged.get("detail_channel")
     return o

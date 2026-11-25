@@ -46,6 +46,12 @@ def parse_expr(expr: str) -> ast.Expression:
             continue
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id in _FUNCS and not node.keywords):
+            n = len(node.args)
+            if any(isinstance(a, ast.Starred) for a in node.args):
+                raise ExpressionError(f"unsupported syntax in expression {expr!r}: *args")
+            if (node.func.id == "abs" and n != 1) or (node.func.id in ("min", "max") and n < 2):
+                need = "exactly 1 argument" if node.func.id == "abs" else "at least 2 arguments"
+                raise ExpressionError(f"{node.func.id}() needs {need} in expression {expr!r}")
             continue
         raise ExpressionError(f"unsupported syntax in expression {expr!r}: {type(node).__name__}")
     return tree
@@ -80,8 +86,11 @@ def evaluate(expr: str, values: dict[str, float]) -> float:
 
 def compute_reading(device: str, spec, readings: dict[str, Reading]) -> Reading:
     """Evaluate a computed channel from the latest readings (invalid if any input is)."""
-    names = expr_names(spec.expr)
+    names = sorted(expr_names(spec.expr))
     inputs = [readings.get(n) for n in names]
+    if inputs and all(r is not None and r.status == "NOT_FOUND" for r in inputs):
+        # This system has none of the inputs (e.g. no compressor driver): hide like them.
+        return Reading(device, spec.name, f"= {spec.expr}", None, None, spec.unit, status="NOT_FOUND")
     if any(r is None or r.value is None for r in inputs):
         missing = sorted(n for n, r in zip(names, inputs) if r is None or r.value is None)
         return Reading(device, spec.name, f"= {spec.expr}", None, None, spec.unit,
@@ -90,7 +99,7 @@ def compute_reading(device: str, spec, readings: dict[str, Reading]) -> Reading:
     ts: datetime | None = min(stamps) if stamps else None  # as old as the oldest input
     try:
         value = evaluate(spec.expr, {n: r.value for n, r in zip(names, inputs)}) * spec.scale
-    except (ZeroDivisionError, OverflowError):
+    except Exception:  # noqa: BLE001 - a bad expression must never stop the other rules
         return Reading(device, spec.name, f"= {spec.expr}", None, ts, spec.unit, status="INVALID")
     return Reading(device, spec.name, f"= {spec.expr}", value, ts, spec.unit, raw=str(value),
                    status="COMPUTED", label=spec.label_for(value))

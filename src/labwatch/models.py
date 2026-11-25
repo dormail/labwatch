@@ -123,6 +123,7 @@ class AlertEvent:
     value: float | None = None
     unit: str | None = None
     since: datetime | None = None  # when the condition started
+    category: str | None = None  # alarm type, e.g. "pulse_tube", "anomaly", "labwatch"
 
     @property
     def headline(self) -> str:

@@ -64,7 +64,7 @@ class Notifier(abc.ABC):
         return f"<{type(self).__name__} {self.name!r} >= {self.min_severity.label}>"
 
 
-LIFECYCLE_IDS = {"labwatch/startup", "labwatch/shutdown", "labwatch/summary"}
+LIFECYCLE_IDS = {"labwatch/startup", "labwatch/shutdown", "labwatch/summary", "labwatch/mute"}
 
 
 def is_lifecycle(event: AlertEvent) -> bool:
