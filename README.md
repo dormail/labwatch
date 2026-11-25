@@ -3,7 +3,7 @@
 Monitors lab equipment and sends warnings when something goes wrong, for example
 when a power outage stops a dilution fridge's pulse tube at 3 a.m.
 
-- **Bluefors fridges** (Control Software v2.x HTTP API, tested with 2.6.1):
+- **Bluefors fridges** (Control Software v2.x HTTP API, tested with 2.6.1 and 2.7.0):
   temperatures, pressures, flow, pulse tube, compressor state, alarms and cooling water.
 - **Any networked PC** (e.g. the Plassys evaporator's control computer): ping or TCP check.
 - **Notifications** via Discord, Telegram, ntfy (phone push), e-mail and the log.
@@ -130,7 +130,8 @@ anchor (`rules: *bluefors_rules`).
     - {channel: reachable, name: PC down for 15 min, not_equals: 1, for: 15m, severity: critical, auto_arm: false}
 ```
 
-Reading the Plassys control software itself (load lock state, pump-down times) is on the roadmap.
+Reading the Plassys control software itself (load lock state, pump-down times) is on the roadmap,
+see [docs/plassys.md](docs/plassys.md).
 
 ### Simulator
 

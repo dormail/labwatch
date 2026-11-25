@@ -1,6 +1,6 @@
 """Bluefors dilution refrigerator via the Control Software (CS1) v2.x HTTP API.
 
-Tested against Control Software 2.6.1 (``api-2.6.1``). The API is served over
+Tested against Control Software 2.6.1 (``api-2.6.1``) and 2.7.0 (``api-2.7.0``). The API is served over
 HTTPS on port 49098 with a self-signed certificate. Authentication is an API
 key (created in the control software) passed as the ``key`` query parameter.
 
