@@ -31,6 +31,9 @@ rule_defaults:
 # ---------------------------------------------------------------------------
 # Where alerts go. Each notifier receives events with severity >= min_severity
 # (info < warning < critical). Remove or set `enabled: false` on unused ones.
+# Status messages about labwatch itself (started/stopped, "alarms armed", daily
+# summary) are delivered regardless of min_severity; `lifecycle: false` turns
+# that off for a notifier. Telegram sends them silently.
 # Try them with:  labwatch test-notify [name] [--severity critical]
 # ---------------------------------------------------------------------------
 notifiers:

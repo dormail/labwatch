@@ -28,6 +28,9 @@ class Notifier(abc.ABC):
     """
 
     type_name: str = ""
+    # Also deliver monitoring status messages (started/stopped, alarms armed, daily
+    # summary) regardless of min_severity. Set per notifier with `lifecycle: false`.
+    lifecycle: bool = True
 
     def __init__(self, name: str, min_severity: Severity = Severity.WARNING) -> None:
         self.name = name
@@ -40,6 +43,8 @@ class Notifier(abc.ABC):
         (a RESOLVED event carries the severity of the alert it resolves).
         """
         if event.kind is EventKind.TEST:
+            return True
+        if self.lifecycle and is_lifecycle(event):
             return True
         return event.severity >= self.min_severity
 
@@ -57,6 +62,16 @@ class Notifier(abc.ABC):
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.name!r} >= {self.min_severity.label}>"
+
+
+LIFECYCLE_IDS = {"labwatch/startup", "labwatch/shutdown", "labwatch/summary"}
+
+
+def is_lifecycle(event: AlertEvent) -> bool:
+    """Status messages about labwatch itself, as opposed to equipment alerts."""
+    return event.kind is EventKind.INFO and (
+        event.rule_id in LIFECYCLE_IDS or event.rule_id.endswith("/armed")
+    )
 
 
 _REGISTRY: dict[str, type[Notifier]] = {}
@@ -86,7 +101,12 @@ def build_notifier(cfg: dict[str, Any]) -> Notifier:
         min_severity = Severity.parse(cfg.pop("min_severity", "warning"))
     except ValueError as e:
         raise NotifierConfigError(f"{type_name} notifier {name!r}: 'min_severity': {e}") from None
-    return cls.from_config(name, min_severity, cfg)
+    lifecycle = cfg.pop("lifecycle", True)
+    if not isinstance(lifecycle, bool):
+        raise NotifierConfigError(f"{type_name} notifier {name!r}: 'lifecycle' must be true or false")
+    notifier = cls.from_config(name, min_severity, cfg)
+    notifier.lifecycle = lifecycle
+    return notifier
 
 
 def registered_types() -> list[str]:
