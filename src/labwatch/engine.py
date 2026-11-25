@@ -200,7 +200,9 @@ class Monitor:
         self._tasks.append(asyncio.create_task(runner(), name=name))
 
     def command_bots(self) -> list:
-        """Telegram command listeners for Telegram notifiers with ``commands: true`` (one per bot)."""
+        """Command listeners for Telegram/Discord notifiers with ``commands: true`` (one per bot)."""
+        from labwatch.discord_bot import DiscordCommandBot
+        from labwatch.notifiers.discord_bot import DiscordBotNotifier
         from labwatch.notifiers.telegram import TelegramNotifier
         from labwatch.telegram_bot import TelegramCommandBot
 
@@ -209,6 +211,9 @@ class Monitor:
             if isinstance(n, TelegramNotifier) and n.commands and n._bot_token not in seen:
                 seen.add(n._bot_token)
                 bots.append(TelegramCommandBot.from_notifier(self, n))
+            elif isinstance(n, DiscordBotNotifier) and n.commands and n._bot_token not in seen:
+                seen.add(n._bot_token)
+                bots.append(DiscordCommandBot(self, n))
         return bots
 
     async def shutdown(self) -> None:

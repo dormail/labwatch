@@ -40,12 +40,28 @@ notifiers:
   - name: console
     type: console
 
+  # Discord bot: one channel per machine; anyone in a channel can /status, /mute, /unmute
+  # (see README: Discord). Channel ids: Developer Mode -> right-click channel -> Copy Channel ID.
   - name: discord
+    type: discord_bot
+    bot_token: ${DISCORD_BOT_TOKEN}
+    channels:
+      Flash: ${DISCORD_FLASH_CHANNEL}
+      Ket: ${DISCORD_KET_CHANNEL}
+      Plassys: ${DISCORD_PLASSYS_CHANNEL}
+    # status_channel: ${DISCORD_STATUS_CHANNEL}   # optional: "labwatch started/stopped" go here only
+    min_severity: warning         # default per channel; /level in a channel changes it
+    mention: "@here"              # pinged on critical alerts only (or "<@&ROLE_ID>")
+
+  # Simpler alternative without commands: a webhook posting everything into one channel.
+  - name: discord-webhook
     type: discord
     webhook_url: ${DISCORD_WEBHOOK_URL}
-    min_severity: info            # the "log" channel: everything incl. daily summary
-    mention: "@here"              # pinged on critical alerts only (or "<@USER_ID>", "<@&ROLE_ID>")
+    min_severity: info
+    enabled: false
 
+  # Telegram: chat_id is the admin. Colleagues message the bot, the admin gets
+  # "/approve <id>"; everyone then gets alerts in their own chat with their own /level and /mute.
   - name: telegram
     type: telegram
     bot_token: ${TELEGRAM_BOT_TOKEN}

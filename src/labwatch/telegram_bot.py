@@ -30,11 +30,10 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from labwatch import report
-from labwatch.models import AlertEvent, EventKind, Severity
+from labwatch import report, subscriptions
+from labwatch.models import AlertEvent, Severity
 from labwatch.notifiers._common import is_urgent
-from labwatch.notifiers.base import is_lifecycle
-from labwatch.state import mute_matches
+from labwatch.subscriptions import CATEGORY_HELP, fmt_until, is_duration
 
 if TYPE_CHECKING:
     from labwatch.engine import DeviceRuntime, Monitor
@@ -43,36 +42,10 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 POLL_TIMEOUT = 50  # seconds, Telegram long polling
-DEFAULT_MUTE = 2 * 3600.0
-_DURATION = re.compile(r"^\d+(\.\d+)?[smhd]?$")
-_FOREVER = {"forever", "off", "indefinitely", "permanent", "permanently"}
-CATEGORY_HELP = {
-    "pulse_tube": "pulse tube & its compressor (CPA)",
-    "temperature": "T50K, T4K, still, MXC",
-    "circulation": "scroll/turbo pumps, flow",
-    "cooling_water": "cooling water",
-    "pressure": "P1–P6",
-    "anomaly": "'unusual compared to the last 24 h'",
-    "connection": "device / PC unreachable",
-    "fse": "fast sample exchange",
-    "labwatch": "started/stopped, alarms armed, mute announcements",
-}
 
 
 class TelegramAPIError(Exception):
     pass
-
-
-def _parse_duration(tok: str) -> float:
-    if tok[-1].isdigit():
-        return float(tok) * 3600  # bare number = hours
-    return float(tok[:-1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[tok[-1]]
-
-
-def _fmt_until(until: float | None) -> str:
-    if until is None:
-        return "until you unmute"
-    return "until " + time.strftime("%a %H:%M", time.localtime(until))
 
 
 class TelegramCommandBot:
@@ -126,17 +99,11 @@ class TelegramCommandBot:
         n = self.notifier
         now = time.time()
         out = []
+        lifecycle = n.lifecycle if n is not None else True
         for s in self.store.subscribers():
-            if event.kind is EventKind.TEST:
-                if s.role != "admin":
-                    continue
-            elif is_lifecycle(event):
-                if n is not None and not n.lifecycle:
-                    continue
-            elif event.severity < Severity.parse(s.level):
-                continue
-            if any(mute_matches(m.target, event.device, event.rule_id, event.category)
-                   for m in self.store.personal_mutes(s.chat_id, now)):
+            if s.chat_id.startswith("discord:"):
+                continue  # Discord channels are served by the Discord bot
+            if not subscriptions.wants(s, event, self.store, lifecycle, now):
                 continue
             chat: str | int = s.chat_id
             if n is not None and n.critical_chat_id and str(s.chat_id) == str(n.chat_id) and is_urgent(event):
@@ -217,38 +184,13 @@ class TelegramCommandBot:
     # -- targets ---------------------------------------------------------------------
 
     def _categories(self) -> list[str]:
-        cats = {r.category for rt in self.monitor.runtimes for r in rt.all_rules} | set(CATEGORY_HELP)
-        return sorted(cats - {"other"})
+        return subscriptions.categories(self.monitor)
 
     def _device(self, name: str) -> DeviceRuntime | None:
-        key = report.command_name(name)
-        for rt in self.monitor.runtimes:
-            if report.command_name(rt.name) == key:
-                return rt
-        return None
+        return subscriptions.find_device(self.monitor, name)
 
     def parse_target(self, tokens: list[str]) -> tuple[str | None, list[str], str]:
-        """(target, remaining tokens, error). Accepts device, category, device+category, all."""
-        if not tokens:
-            return None, [], "say what to mute"
-        cats = self._categories()
-        first = tokens[0].lower()
-        if first in ("all", "*", "everything"):
-            return "*", tokens[1:], ""
-        if "/" in first:
-            dev, _, cat = first.partition("/")
-            rt = self._device(dev)
-            if rt and cat in cats:
-                return f"{rt.name}/{cat}", tokens[1:], ""
-            return None, [], f"unknown target {tokens[0]!r}"
-        rt = self._device(first)
-        if rt is not None:
-            if len(tokens) > 1 and tokens[1].lower() in cats:
-                return f"{rt.name}/{tokens[1].lower()}", tokens[2:], ""
-            return rt.name, tokens[1:], ""
-        if first in cats:
-            return first, tokens[1:], ""
-        return None, [], f"unknown target {tokens[0]!r}"
+        return subscriptions.parse_target(self.monitor, tokens)
 
     def targets_help(self) -> str:
         devs = ", ".join(rt.name for rt in self.monitor.runtimes)
@@ -332,22 +274,21 @@ class TelegramCommandBot:
         target, rest, err = self.parse_target(args)
         if err:
             return f"{html.escape(err)}.\n\n{self.targets_help()}"
-        duration: float | None = DEFAULT_MUTE
-        if rest and (rest[0].lower() in _FOREVER or _DURATION.match(rest[0].lower())):
-            tok = rest.pop(0).lower()
-            duration = None if tok in _FOREVER else _parse_duration(tok)
+        duration: float | None = subscriptions.DEFAULT_MUTE
+        if rest and is_duration(rest[0]):
+            duration = subscriptions.parse_duration(rest.pop(0))
         until = None if duration is None else now + duration
         if everyone:
-            if until is None or duration > 14 * 86400:
+            if until is None or duration > subscriptions.MAX_GLOBAL_MUTE:
                 return "Mutes for everyone need a duration of at most 14 days, e.g. /muteall Flash 2d warm-up."
             reason = " ".join(rest).strip()
             by = f"by {name}" if name else ""
             self.store.mute(target, until, "; ".join(x for x in (reason, by) if x))
-            return f"🔕 Muted {html.escape(target)} for everyone {_fmt_until(until)}. Everybody will be told."
+            return f"🔕 Muted {html.escape(target)} for everyone {fmt_until(until)}. Everybody will be told."
         if chat_id is None:
             return "Not available."
         self.store.personal_mute(chat_id, target, until)
-        return (f"🔕 Muted {html.escape(target)} for you {_fmt_until(until)}.\n"
+        return (f"🔕 Muted {html.escape(target)} for you {fmt_until(until)}.\n"
                 f"Others still get these alerts. Undo: /unmute {html.escape(target)}")
 
     def _mutes_text(self, chat_id, global_mutes, now: float) -> str:
@@ -355,10 +296,10 @@ class TelegramCommandBot:
         mine = self.store.personal_mutes(chat_id, now) if chat_id is not None else []
         if mine:
             lines.append("<b>Muted for you</b>")
-            lines += [f"  🔕 {html.escape(m.target)} {_fmt_until(m.until)}" for m in mine]
+            lines += [f"  🔕 {html.escape(m.target)} {fmt_until(m.until)}" for m in mine]
         if global_mutes:
             lines.append("<b>Muted for everyone</b>")
-            lines += [f"  🔕 {html.escape(m.target)} {_fmt_until(m.until)}"
+            lines += [f"  🔕 {html.escape(m.target)} {fmt_until(m.until)}"
                       + (f" ({html.escape(m.reason)})" if m.reason else "") for m in global_mutes]
         return "\n".join(lines) if lines else "Nothing is muted."
 

@@ -46,6 +46,32 @@ def allowed_mentions(mention: str | None) -> dict[str, list[str]]:
     return allowed
 
 
+def build_message(event: AlertEvent, mention: str | None = None) -> dict[str, Any]:
+    """Discord message (embed + optional ping on urgent alerts), for webhooks and the bot."""
+    embed: dict[str, Any] = {
+        "title": _truncate(event.headline, 256),
+        "color": _color(event),
+        "timestamp": event.timestamp.isoformat(),
+    }
+    if event.message:
+        embed["description"] = _truncate(event.message, 4000)
+    fields = [("Device", event.device), ("Channel", event.channel)]
+    if event.value is not None:
+        fields.append(("Value", format_quantity(event.value, event.unit)))
+    if event.since is not None:
+        fields.append(("Since", f"<t:{int(event.since.timestamp())}:R>"))
+    embed["fields"] = [
+        {"name": k, "value": _truncate(str(v), 1024), "inline": True} for k, v in fields if v
+    ]
+    payload: dict[str, Any] = {"embeds": [embed]}
+    if mention and is_urgent(event):
+        payload["content"] = _truncate(f"{mention} {event.headline}", 2000)
+        payload["allowed_mentions"] = allowed_mentions(mention)
+    else:
+        payload["allowed_mentions"] = {"parse": []}
+    return payload
+
+
 @register("discord")
 class DiscordNotifier(HttpNotifier):
     """Config: ``webhook_url`` (required, secret), ``mention`` (optional: "@here",
@@ -85,29 +111,7 @@ class DiscordNotifier(HttpNotifier):
         return [self._webhook_url, self._webhook_url.split("?")[0].rstrip("/").rsplit("/", 1)[-1]]
 
     def build_payload(self, event: AlertEvent) -> dict[str, Any]:
-        embed: dict[str, Any] = {
-            "title": _truncate(event.headline, 256),
-            "color": _color(event),
-            "timestamp": event.timestamp.isoformat(),
-        }
-        if event.message:
-            embed["description"] = _truncate(event.message, 4000)
-        fields = [("Device", event.device), ("Channel", event.channel)]
-        if event.value is not None:
-            fields.append(("Value", format_quantity(event.value, event.unit)))
-        if event.since is not None:
-            fields.append(("Since", f"<t:{int(event.since.timestamp())}:R>"))
-        embed["fields"] = [
-            {"name": k, "value": _truncate(str(v), 1024), "inline": True} for k, v in fields if v
-        ]
-
-        payload: dict[str, Any] = {"username": self.username, "embeds": [embed]}
-        if self.mention and is_urgent(event):
-            payload["content"] = _truncate(f"{self.mention} {event.headline}", 2000)
-            payload["allowed_mentions"] = allowed_mentions(self.mention)
-        else:
-            payload["allowed_mentions"] = {"parse": []}
-        return payload
+        return {"username": self.username, **build_message(event, self.mention)}
 
     async def send(self, event: AlertEvent) -> None:
         # Non-2xx (including 429 rate limiting) raises; the dispatcher retries.

@@ -9,7 +9,7 @@ from labwatch.notifiers.base import (
 )
 
 # Import built-in notifiers so they register themselves.
-from labwatch.notifiers import console, discord, email, ntfy, telegram  # noqa: E402,F401
+from labwatch.notifiers import console, discord, discord_bot, email, ntfy, telegram  # noqa: E402,F401
 
 __all__ = [
     "Notifier",

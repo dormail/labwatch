@@ -169,34 +169,58 @@ Notifications). On iOS, allow Telegram in your Focus modes. Telegram doesn't sup
 "Critical Alerts", so a phone on silent may stay silent. Keep a second channel (e.g. ntfy)
 for the alerts that must wake you.
 
-**Commands:** while `labwatch run` is running, the bot also answers commands. Type `/`
-in the chat to see the menu:
+**Several people:** colleagues open the bot and press Start. You, the admin (`chat_id`), get
+`Access request from Ana … /approve 123456`. After approval everyone gets alerts in their
+own chat, with their own settings:
 
 | command | answer |
 |---|---|
-| `/status` | one line per device: OK / alerts, key temperatures, data age |
-| `/flash`, `/ket`, `/plassys`, … | details: temperatures, pulse tube, compressor, pressures, FSE (with `fse: true`), armed alarms, mutes |
+| `/status`, `/flash`, `/ket`, `/plassys` | overview or details (temperatures, pulse tube, cooling water, pumps, FSE) |
 | `/alerts` | active alerts |
+| `/mute Flash 4h`, `/mute anomaly`, `/mute Ket circulation 1d`, `/mute all 8h` | mute **for yourself** (others still get them) |
+| `/unmute …`, `/unmute all`, `/mutes` | undo / list |
+| `/level critical\|warning\|info` | what you get (critical = only what rings) |
+| `/muteall Flash 2d warm-up`, `/unmuteall Flash` | mute for **everyone**, announced to everyone |
+| `/users`, `/approve <id>`, `/remove <id>` | admins only |
 
-Only the configured chats (`chat_id`, `critical_chat_id`, `allowed_chat_ids`) get answers.
-Anyone can find a bot by name, so other chats are ignored. Turn this off with `commands: false`.
+Alarm types for muting:
+- `pulse_tube`, `temperature`, `circulation`, `cooling_water`, `pressure`, `fse`
+- `anomaly` (unusual values), `connection` (unreachable)
+- `labwatch` (started/stopped messages)
 
-### Discord
+Strangers get no lab data until approved. Turn the commands off with `commands: false`.
 
-You need no bot or developer account, only a **channel webhook** on a server where you
-have *Manage Webhooks*. Your own private server works.
-1. Create a channel, e.g. `#fridge-alerts`.
-2. Server Settings → Integrations → Webhooks → New Webhook, pick the channel, **Copy Webhook URL**.
-3. Put the URL in `.env` as `DISCORD_WEBHOOK_URL`. It is a password: anyone with it can
-   post. To revoke it, delete the webhook and create a new one.
-4. Pings: `mention: "@here"`, `"<@USER_ID>"` or `"<@&ROLE_ID>"`. This is used only for
-   critical alerts. Get IDs via User Settings → Advanced → Developer Mode, then right-click → Copy ID.
-   User mentions are the most reliable.
-5. On your phone, set the channel to *All Messages* (or *Only @mentions* if critical alerts
-   ping you) and don't mute the server.
+### Discord (one bot, a channel per machine)
 
-Discord has no custom per-channel sounds and doesn't bypass DND. Use it as the log/overview
-channel and Telegram or ntfy for waking up.
+Each machine's alerts go to its own channel (#flash, #ket, #plassys).
+**Everyone in a channel** can use slash commands. A mute applies to that channel,
+so to the whole group, and the bot says publicly who muted what.
+
+| command | what it does |
+|---|---|
+| `/status [device]` | overview, or one machine (only you see the answer) |
+| `/alerts` | active alerts |
+| `/mute [what] [duration]` | mute this channel: `all` (default), `anomaly`, `pulse_tube`, `circulation`, … for `30m`/`4h`/`2d`/`forever` (default 2 h) |
+| `/unmute [what]` | unmute (default: everything muted here) |
+| `/mutes` | what's muted here and for everyone |
+| `/level critical\|warning\|info` | what this channel gets |
+| `/muteall what duration [reason]` | mute for everyone (all channels and Telegram), announced everywhere; max 14 days |
+
+**Setup** (once; you need *Manage Server* on your group's Discord server):
+1. Open <https://discord.com/developers/applications> → **New Application**, name it e.g. `labwatch`.
+2. **Bot** tab → **Reset Token** → copy it into `.env` as `DISCORD_BOT_TOKEN`. It is a password.
+   No privileged intents are needed. You can switch off *Public Bot* so only you can add it.
+3. **OAuth2 → URL Generator**:
+   - Scopes: `bot` and `applications.commands`.
+   - Bot permissions: *View Channels*, *Send Messages*, *Embed Links*, plus *Mention Everyone* if you use `mention: "@here"`.
+   - Open the generated URL and add the bot to your server.
+4. In Discord, turn on User Settings → Advanced → **Developer Mode**. Right-click each machine
+   channel → **Copy Channel ID** → `.env` (`DISCORD_FLASH_CHANNEL`, `DISCORD_KET_CHANNEL`, …).
+   For private channels, give the bot access in the channel's permissions.
+5. Restart labwatch. The slash commands appear within seconds, and `labwatch test-notify discord`
+   posts a test into the channels.
+
+For a single channel without commands, a plain webhook still works (`type: discord`, `webhook_url`).
 
 ### ntfy (phone push, no account needed)
 
