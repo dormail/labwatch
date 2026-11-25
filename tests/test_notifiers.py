@@ -92,7 +92,8 @@ def test_discord_critical_firing_embed_and_mention():
     send(discord(rec, mention="<@&42>"), make_event())
 
     req = rec.requests[0]
-    assert req.method == "POST" and str(req.url) == WEBHOOK
+    assert req.method == "POST" and str(req.url) == WEBHOOK + "?wait=true"
+    assert req.headers["User-Agent"].startswith("DiscordBot (")
     p = rec.payload
     assert p["username"] == "labwatch"
     assert p["content"] == "<@&42> [CRITICAL] Flash: T4K above 6 K"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from labwatch import __version__
 from labwatch.models import AlertEvent, EventKind, Severity, format_quantity
 from labwatch.notifiers._common import ConfigReader, HttpNotifier, is_urgent
 from labwatch.notifiers.base import register
@@ -110,4 +111,12 @@ class DiscordNotifier(HttpNotifier):
 
     async def send(self, event: AlertEvent) -> None:
         # Non-2xx (including 429 rate limiting) raises; the dispatcher retries.
-        await self._post(self._webhook_url, json=self.build_payload(event))
+        # ?wait=true makes Discord confirm the message was created (200 + message)
+        # instead of a fire-and-forget 204. Discord asks for a "DiscordBot (url, version)"
+        # User-Agent and may block requests without one.
+        await self._post(
+            self._webhook_url,
+            params={"wait": "true"},
+            json=self.build_payload(event),
+            headers={"User-Agent": f"DiscordBot (https://github.com/dormail/labwatch, {__version__})"},
+        )

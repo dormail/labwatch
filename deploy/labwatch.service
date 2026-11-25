@@ -1,0 +1,30 @@
+# systemd service for labwatch.
+#
+#   sudo cp deploy/labwatch.service /etc/systemd/system/
+#   sudo systemctl edit labwatch      # adjust User= / WorkingDirectory= if needed
+#   sudo systemctl enable --now labwatch
+#   journalctl -u labwatch -f
+#
+# WorkingDirectory must contain config.yaml and .env.
+
+[Unit]
+Description=labwatch lab equipment monitor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=labwatch
+WorkingDirectory=/opt/labwatch
+ExecStart=/opt/labwatch/.venv/bin/labwatch run
+Restart=always
+RestartSec=10
+# Keep the secrets file private and the service contained.
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/labwatch
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
