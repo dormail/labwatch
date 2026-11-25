@@ -84,7 +84,7 @@ def device_html(rt: DeviceRuntime, mutes: list[Mute], now: float | None = None) 
         rows = []
         for ch in channels:
             r = rt.latest.get(ch)
-            if r is None:
+            if r is None or r.status == "NOT_FOUND":  # this system doesn't have it
                 continue
             if not title:  # free text line (e.g. Bluefors status message)
                 text = r.format_value()

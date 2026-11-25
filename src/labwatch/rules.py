@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import abc
 import collections
+import statistics
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
@@ -65,6 +66,16 @@ class History:
     def window(self, channel: str, seconds: float, now: float) -> list[tuple[float, float]]:
         return [(t, v) for t, v in self._data.get(channel, ()) if t >= now - seconds]
 
+    def points(self, channel: str) -> collections.deque[tuple[float, float]]:
+        return self._data.get(channel) or collections.deque()
+
+    def seed(self, channel: str, samples: Iterable[tuple[float, float]]) -> None:
+        """Add stored samples (e.g. after a restart), oldest first, skipping duplicates."""
+        dq = self._data[channel]
+        for ts, value in samples:
+            if not dq or ts > dq[-1][0]:
+                dq.append((ts, value))
+
 
 def slope_per_minute(points: list[tuple[float, float]]) -> float | None:
     """Least-squares slope in units per minute."""
@@ -84,6 +95,10 @@ class Context:
     now: float  # epoch seconds
     readings: dict[str, Reading]  # latest reading per channel
     history: History
+    # Steady-state gate of the device (see SteadyState). Without a gate: always ready.
+    steady_ready: bool = True
+    steady_ready_at: float | None = None  # when the device became "settled"
+    steady_detail: str = ""
 
 
 @dataclass
@@ -137,6 +152,7 @@ class RuleOptions:
     message: str = ""  # extra text for humans, e.g. what to check
     detail_channel: str | None = None  # append this channel's text (e.g. alarm text)
     on_invalid: str = "ignore"  # "alarm": an unreadable value (DISCONNECTED, INVALID) counts as a problem
+    steady_only: bool = False  # only arm/fire while the device is in its steady state (not cooling down)
 
 
 class Rule(abc.ABC):
@@ -175,10 +191,23 @@ class Rule(abc.ABC):
     def title(self) -> str:
         return f"{self.device}: {self.name}"
 
+    @property
+    def horizon(self) -> float:
+        """How much history (seconds) this rule needs."""
+        return 0.0
+
     def step(self, ctx: Context) -> tuple[Verdict, str | None]:
         """Evaluate and advance the state machine. Returns (verdict, transition)."""
-        v = self.check(ctx)
         st = self.state
+        if self.opts.steady_only and not ctx.steady_ready:
+            # Cooldown / warm-up / not settled yet: don't arm or fire. A firing alert is
+            # never silenced by this - it just isn't re-evaluated until the device settles.
+            if not st.firing:
+                st.armed = not self.opts.auto_arm
+                st.pending_since = None
+                st.healthy_since = None
+            return Verdict(None, detail=f"paused: {ctx.steady_detail}"), None
+        v = self.check(ctx)
         now = ctx.now
         if v.active is None:
             return v, None
@@ -278,6 +307,10 @@ class RateRule(Rule):
         self.window = float(window)
         self.unit = unit
         super().__init__(device, channel, name, opts)
+
+    @property
+    def horizon(self) -> float:
+        return self.window
 
     def describe(self) -> str:
         u = f"{self.unit}/min" if self.unit else "/min"
@@ -391,6 +424,139 @@ class UnreachableRule(Rule):
         return Verdict(active, down_for, detail)
 
 
+class DeviationRule(Rule):
+    """Anomaly detection: the value left the band it normally sits in.
+
+    "Normal" is the median of the channel over ``baseline`` (default 24 h), leaving
+    out the most recent ``exclude_recent`` (default 1 h) so a slow drift can't teach
+    itself in. The allowed deviation is ``deviation`` (absolute, or "5%" of the
+    normal value) or ``noise_factor`` x the channel's own noise, whichever is larger.
+    With ``steady_only`` (default for this rule) it only learns and alerts while the
+    device is in its steady state, so cooldowns and warm-ups are excluded.
+    """
+
+    kind = "deviation"
+
+    def __init__(self, device, channel, name, opts, deviation, baseline=86400.0, exclude_recent=3600.0,
+                 noise_factor=4.0, min_baseline=None, unit=None):
+        s = str(deviation).strip()
+        self.relative = s.endswith("%")
+        self.deviation = float(s[:-1]) / 100.0 if self.relative else float(s)
+        if self.deviation <= 0:
+            raise RuleConfigError("'deviation' must be positive")
+        self.baseline = float(baseline)
+        self.exclude_recent = float(exclude_recent)
+        self.noise_factor = float(noise_factor)
+        self.min_baseline = float(min_baseline) if min_baseline is not None else self.baseline / 4
+        self.unit = unit
+        super().__init__(device, channel, name, opts)
+
+    @property
+    def horizon(self) -> float:
+        return self.baseline + self.exclude_recent
+
+    def describe(self) -> str:
+        d = f"{self.deviation * 100:g}%" if self.relative else _fmt(self.deviation, self.unit)
+        return f"unusual (more than {d} from normal)"
+
+    def check(self, ctx: Context) -> Verdict:
+        r = self._reading(ctx)
+        if r is None or r.value is None:
+            return Verdict(None)
+        end = ctx.now - self.exclude_recent
+        start = end - self.baseline
+        if self.opts.steady_only and ctx.steady_ready_at is not None:
+            start = max(start, ctx.steady_ready_at)  # learn only from settled data
+        pts = [(t, v) for t, v in ctx.history.window(self.channel, ctx.now - start, ctx.now) if t <= end]
+        vals = [v for _, v in pts]
+        span = (pts[-1][0] - pts[0][0]) if len(pts) > 1 else 0.0
+        if len(vals) < 20 or span < self.min_baseline:
+            return Verdict(None, detail=f"learning what's normal: {span / 3600:.1f} h of "
+                                        f"{self.min_baseline / 3600:g} h collected")
+        med = statistics.median(vals)
+        sigma = 1.4826 * statistics.median(abs(v - med) for v in vals)
+        allowed = max(self.deviation * abs(med) if self.relative else self.deviation, self.noise_factor * sigma)
+        x = r.value
+        active = abs(x - med) > allowed
+        return Verdict(active, x, f"{self.channel} = {r.format_value()}, normally {_fmt(med, self.unit)} "
+                                  f"(±{_fmt(allowed, self.unit)}, learned over {span / 3600:.0f} h)")
+
+
+@dataclass
+class GateCondition:
+    channel: str
+    above: float | None = None
+    below: float | None = None
+
+    def ok(self, v: float) -> bool:
+        return (self.above is None or v > self.above) and (self.below is None or v < self.below)
+
+    def describe(self, unit: str | None = None) -> str:
+        parts = []
+        if self.below is not None:
+            parts.append(f"< {_fmt(self.below, unit)}")
+        if self.above is not None:
+            parts.append(f"> {_fmt(self.above, unit)}")
+        return f"{self.channel} {' and '.join(parts)}"
+
+
+class SteadyState:
+    """"The device is settled": all conditions held continuously for ``for_s`` seconds.
+
+    For a fridge: cold and circulating (T4K < 4.5 K, Tstill < 1.5 K) for 6 h, so
+    cooldowns, condensing and warm-ups are excluded. Computed from the reading
+    history, so it survives restarts.
+    """
+
+    def __init__(self, conditions: list[GateCondition], for_s: float, units: dict[str, str | None] | None = None):
+        self.conditions = conditions
+        self.for_s = for_s
+        self.units = units or {}
+
+    @classmethod
+    def from_config(cls, device: str, cfg: Any, channel_specs: dict[str, Any]) -> SteadyState | None:
+        if not cfg:
+            return None
+        where = f"device {device!r}, steady_state"
+        if not isinstance(cfg, dict) or not isinstance(cfg.get("conditions"), list) or not cfg["conditions"]:
+            raise RuleConfigError(f"{where}: needs 'conditions: [{{channel: T4K, below: 4.5}}, ...]'")
+        conds = []
+        for c in cfg["conditions"]:
+            if not isinstance(c, dict) or c.get("channel") not in channel_specs:
+                raise RuleConfigError(f"{where}: unknown channel in condition {c!r}")
+            unknown = set(c) - {"channel", "above", "below"}
+            if unknown or ("above" not in c and "below" not in c):
+                raise RuleConfigError(f"{where}: condition {c!r} needs 'above' and/or 'below' (only)")
+            conds.append(GateCondition(c["channel"], _opt_float(c.get("above")), _opt_float(c.get("below"))))
+        units = {c.channel: getattr(channel_specs[c.channel], "unit", None) for c in conds}
+        return cls(conds, parse_duration(cfg.get("for", "6h")), units)
+
+    def evaluate(self, readings: dict[str, Reading], history: History, now: float) -> tuple[bool, float | None, str]:
+        """Returns (ready, ready_at, detail)."""
+        since = float("-inf")
+        for c in self.conditions:
+            r = readings.get(c.channel)
+            if r is None or r.value is None:
+                return False, None, f"{c.channel} unavailable"
+            if not c.ok(r.value):
+                return False, None, f"{c.channel} = {r.format_value()} (steady needs {c.describe(self.units.get(c.channel))})"
+            pts = history.points(c.channel)
+            ok_since = pts[0][0] if pts else now
+            for t, v in reversed(pts):
+                if not c.ok(v):
+                    break
+                ok_since = t
+            since = max(since, ok_since)
+        ready_at = since + self.for_s
+        if now < ready_at:
+            return False, None, f"settling: steady for {(now - since) / 3600:.1f} h of {self.for_s / 3600:g} h"
+        return True, ready_at, ""
+
+
+def _opt_float(v: Any) -> float | None:
+    return None if v is None else float(v)
+
+
 def _as_float_set(v: Any) -> set[float]:
     if v is None:
         return set()
@@ -405,19 +571,21 @@ def _as_float_set(v: Any) -> set[float]:
 
 _OPTION_KEYS = {
     "severity", "for", "clear_for", "auto_arm", "arm_after", "repeat_interval", "message", "detail_channel",
-    "on_invalid",
+    "on_invalid", "steady_only",
 }
 _KIND_KEYS = {
     "threshold": {"above", "below", "hysteresis"},
     "rate": {"rate_above", "rate_below", "window"},
     "state": {"equals", "not_equals"},
     "max_age": {"max_age"},
+    "deviation": {"deviation", "baseline", "exclude_recent", "noise_factor", "min_baseline"},
 }
 _TRIGGER_KEYS = {
     "threshold": {"above", "below"},
     "rate": {"rate_above", "rate_below"},
     "state": {"equals", "not_equals"},
     "max_age": {"max_age"},
+    "deviation": {"deviation"},
 }
 
 
@@ -439,6 +607,8 @@ def build_options(cfg: dict[str, Any], defaults: dict[str, Any]) -> RuleOptions:
     o.on_invalid = str(merged.get("on_invalid", "ignore")).lower()
     if o.on_invalid not in ("ignore", "alarm"):
         raise ValueError(f"on_invalid must be 'ignore' or 'alarm', got {o.on_invalid!r}")
+    if "steady_only" in merged:
+        o.steady_only = bool(merged["steady_only"])
     o.message = str(merged.get("message") or "")
     o.detail_channel = merged.get("detail_channel")
     return o
@@ -456,7 +626,7 @@ def build_rule(device: str, cfg: dict[str, Any], defaults: dict[str, Any], chann
     if len(kinds) != 1:
         raise RuleConfigError(
             f"{where}: need exactly one condition type (above/below, rate_above/rate_below, "
-            f"equals/not_equals or max_age), found {kinds or 'none'}"
+            f"equals/not_equals, max_age or deviation), found {kinds or 'none'}"
         )
     kind = kinds[0]
     unknown = set(cfg) - _OPTION_KEYS - _KIND_KEYS[kind] - {"channel", "name"}
@@ -467,6 +637,8 @@ def build_rule(device: str, cfg: dict[str, Any], defaults: dict[str, Any], chann
     name = cfg.get("name")
     try:
         opts = build_options(cfg, defaults)
+        if kind == "deviation" and "steady_only" not in cfg:
+            opts.steady_only = True  # anomaly detection never learns from cooldowns
         if kind == "threshold":
             return ThresholdRule(device, channel, name, opts, cfg.get("above"), cfg.get("below"),
                                  cfg.get("hysteresis", 0.0), unit)
@@ -476,6 +648,15 @@ def build_rule(device: str, cfg: dict[str, Any], defaults: dict[str, Any], chann
         if kind == "state":
             return StateRule(device, channel, name, opts, cfg.get("equals"), cfg.get("not_equals"),
                              dict(getattr(spec, "labels", ()) or ()))
+        if kind == "deviation":
+            return DeviationRule(
+                device, channel, name, opts, cfg["deviation"],
+                baseline=parse_duration(cfg.get("baseline", "24h")),
+                exclude_recent=parse_duration(cfg.get("exclude_recent", "1h")),
+                noise_factor=float(cfg.get("noise_factor", 4.0)),
+                min_baseline=parse_duration(cfg["min_baseline"]) if "min_baseline" in cfg else None,
+                unit=unit,
+            )
         return MaxAgeRule(device, channel, name, opts, parse_duration(cfg["max_age"]))
     except (TypeError, ValueError) as e:
         raise RuleConfigError(f"{where}: {e}") from None

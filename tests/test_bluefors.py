@@ -205,7 +205,7 @@ def test_bad_date_gives_no_timestamp():
 def test_value_not_found_gives_invalid_reading_and_poll_succeeds(caplog):
     values = dict(GOOD_VALUES)
     del values["driver.cpa.alarm_state_text"]  # e.g. a fridge without a CPA compressor driver
-    caplog.set_level(logging.WARNING, logger="labwatch")
+    caplog.set_level(logging.INFO, logger="labwatch")  # a missing feature is normal: INFO, not WARNING
     dev = device(FakeAPI(values))
     readings = {r.channel: r for r in run(dev)}
     missing = readings["cpa_alarm_text"]
@@ -217,7 +217,7 @@ def test_value_not_found_gives_invalid_reading_and_poll_succeeds(caplog):
 
 
 def test_value_not_found_is_logged_only_once(caplog):
-    caplog.set_level(logging.WARNING, logger="labwatch.devices.bluefors")
+    caplog.set_level(logging.INFO, logger="labwatch.devices.bluefors")
     # One good channel keeps the poll successful; the missing one is logged once.
     dev = device(FakeAPI(GOOD_VALUES), {"T50K": DEFAULT_CHANNELS["T50K"],
                                         "bogus": ChannelSpec("bogus", "mapper.bf.does_not_exist")})

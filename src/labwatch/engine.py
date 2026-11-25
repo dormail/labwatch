@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 
 import httpx
 
+from labwatch.computed import compute_reading
 from labwatch.config import Config, ConfigError
 from labwatch.devices import Device, DeviceError, build_device
 from labwatch.models import AlertEvent, EventKind, Reading, Severity, utcnow
@@ -20,6 +21,7 @@ from labwatch.rules import (
     Rule,
     RuleConfigError,
     RuleState,
+    SteadyState,
     Transition,
     UnreachableRule,
     build_options,
@@ -58,6 +60,26 @@ class DeviceRuntime:
     history: History = field(default_factory=History)
     latest: dict[str, Reading] = field(default_factory=dict)
     last_poll_ok: bool | None = None
+    steady: SteadyState | None = None
+
+    def context(self, now: float) -> Context:
+        ctx = Context(now=now, readings=self.latest, history=self.history)
+        if self.steady is not None:
+            ctx.steady_ready, ctx.steady_ready_at, ctx.steady_detail = self.steady.evaluate(
+                self.latest, self.history, now
+            )
+        return ctx
+
+    def add_computed(self, now: float) -> list[Reading]:
+        """Evaluate computed channels from the latest readings; returns the new readings."""
+        out = []
+        for spec in self.device.channels.values():
+            if spec.computed:
+                r = compute_reading(self.name, spec, self.latest)
+                self.latest[spec.name] = r
+                self.history.add(r, now)
+                out.append(r)
+        return out
 
     @property
     def name(self) -> str:
@@ -122,12 +144,10 @@ class Monitor:
             dev = devices.get(rt.name)
             if dev is not None and dev["last_success"] is not None:
                 rt.unreachable.last_success = dev["last_success"]
-            # Seed history so rate rules work right after a restart.
+            # Seed history so rate/anomaly rules and the steady-state gate work right after
+            # a restart (the table has one row per poll; seed() dedupes).
             for ch in rt.device.channels:
-                dq = rt.history._data[ch]
-                for ts, value in self.store.history(rt.name, ch, since):
-                    if not dq or ts > dq[-1][0]:  # the table has one row per poll; dedupe
-                        dq.append((ts, value))
+                rt.history.seed(ch, self.store.history(rt.name, ch, time.time() - rt.history.keep))
 
     def _save_state(self) -> None:
         self.store.save_rule_states(
@@ -235,6 +255,7 @@ class Monitor:
         for r in readings:
             rt.latest[r.channel] = r
             rt.history.add(r, now)
+        readings = [*readings, *rt.add_computed(now)]
         self.store.save_readings(readings, now)
         self.store.device_ok(rt.name, now)
         return self.evaluate(rt, now)
@@ -242,7 +263,7 @@ class Monitor:
     # -- rule evaluation -------------------------------------------------------
 
     def evaluate(self, rt: DeviceRuntime, now: float, rules: list[Rule] | None = None) -> list[AlertEvent]:
-        ctx = Context(now=now, readings=rt.latest, history=rt.history)
+        ctx = rt.context(now)
         mutes = self.store.mutes(now)
         events: list[AlertEvent] = []
         armed: list[Rule] = []
@@ -445,13 +466,25 @@ def build_runtime(config: Config, sec) -> DeviceRuntime:
         ),
     }
     unreachable = UnreachableRule(device.name, device.unreachable_after, build_options(unreach_cfg, config.rule_defaults))
+    if "steady_state" in sec.cfg:
+        steady_cfg = sec.cfg["steady_state"]  # explicit (null/false disables the gate)
+    elif device.default_steady_state:
+        # Built-in default: only the conditions whose channels this device actually has.
+        d = device.default_steady_state
+        conds = [c for c in d["conditions"] if c["channel"] in device.channels]
+        steady_cfg = {**d, "conditions": conds} if conds else None
+    else:
+        steady_cfg = None
+    steady = SteadyState.from_config(device.name, steady_cfg, device.channels) if steady_cfg else None
+    # Keep enough in-memory history for the longest rule window and the steady-state gate.
+    keep = max([3600.0, *(r.horizon for r in rules), steady.for_s if steady else 0.0]) + 3600.0
     for r in rules:
         if r.rule_id == unreachable.rule_id:
             raise RuleConfigError(
                 f"device {device.name!r}: rule name 'unreachable' is reserved for the built-in "
                 "connection rule; pick another name"
             )
-    return DeviceRuntime(device=device, rules=rules, unreachable=unreachable)
+    return DeviceRuntime(device=device, rules=rules, unreachable=unreachable, history=History(keep), steady=steady)
 
 
 def _muted_by(mutes: list[Mute], rule: Rule) -> bool:

@@ -30,6 +30,11 @@ class ChannelSpec:
     unit: str | None = None
     scale: float = 1.0  # multiply raw values, e.g. 1000 to show K as mK
     labels: tuple[tuple[int, str], ...] = ()  # enumeration value -> text, e.g. ((0, "off"), (1, "on"))
+    expr: str | None = None  # computed channel, e.g. "cooling_water_out - cooling_water_in"
+
+    @property
+    def computed(self) -> bool:
+        return self.expr is not None
 
     def label_for(self, value: float | None) -> str | None:
         if value is None or not self.labels or value != int(value):
@@ -41,9 +46,10 @@ class ChannelSpec:
         if isinstance(spec, str):
             return cls(name=name, source=spec)
         if isinstance(spec, dict):
-            source = spec.get("path") or spec.get("source")
+            expr = spec.get("expr")
+            source = spec.get("path") or spec.get("source") or (f"= {expr}" if expr else None)
             if not source:
-                raise DeviceConfigError(f"channel {name!r}: missing 'path'")
+                raise DeviceConfigError(f"channel {name!r}: needs 'path' (or 'expr' for a computed channel)")
             labels = spec.get("labels") or {}
             if not isinstance(labels, dict):
                 raise DeviceConfigError(f"channel {name!r}: 'labels' must be a mapping like {{0: off, 1: on}}")
@@ -53,6 +59,7 @@ class ChannelSpec:
                 unit=spec.get("unit"),
                 scale=float(spec.get("scale", 1.0)),
                 labels=tuple((int(k), str(v)) for k, v in labels.items()),
+                expr=str(expr) if expr else None,
             )
         raise DeviceConfigError(f"channel {name!r}: expected a path string or a mapping, got {spec!r}")
 
@@ -70,6 +77,8 @@ class Device(abc.ABC):
     type_name: str = ""
     summary_channels: tuple[str, ...] = ()  # shown as context in alert messages
     overview_channels: tuple[str, ...] = ()  # one-line overview (e.g. Telegram /status)
+    # Default `steady_state` gate (see labwatch.rules.SteadyState); None = no gate.
+    default_steady_state: dict | None = None
 
     @property
     def status_sections(self) -> list[tuple[str, tuple[str, ...]]]:
@@ -158,4 +167,20 @@ def parse_channels(
         channels.pop(ch_name, None)
     if not channels:
         raise DeviceConfigError(f"device {name!r}: no channels configured")
+    from labwatch.computed import ExpressionError, expr_names
+
+    for spec in list(channels.values()):
+        if not spec.computed:
+            continue
+        try:
+            missing = expr_names(spec.expr) - set(channels)
+        except ExpressionError as e:
+            raise DeviceConfigError(f"device {name!r}, channel {spec.name!r}: {e}") from None
+        if missing:
+            if spec.name in (defaults or {}) and spec.name not in (cfg.get("channels") or {}):
+                channels.pop(spec.name)  # a default computed channel whose inputs were excluded
+                continue
+            raise DeviceConfigError(
+                f"device {name!r}, channel {spec.name!r}: expression uses unknown channel(s) {sorted(missing)}"
+            )
     return channels

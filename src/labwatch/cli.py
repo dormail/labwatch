@@ -17,7 +17,7 @@ from labwatch.devices import DeviceConfigError, DeviceError, build_device
 from labwatch.engine import Monitor, build_runtime, fmt_duration, fmt_time
 from labwatch.models import AlertEvent, EventKind, Reading, Severity
 from labwatch.notifiers import NotifierConfigError, build_notifier
-from labwatch.rules import Context, RuleConfigError, RuleState, parse_duration
+from labwatch.rules import RuleConfigError, RuleState, Verdict, parse_duration
 from labwatch.state import StateStore
 
 log = logging.getLogger("labwatch")
@@ -138,23 +138,26 @@ def cmd_check(cfg: Config, args) -> int:
             await dev.aclose()
         now = time.time()
         for ch in dev.channels:
-            for ts, v in store.history(dev.name, ch, now - 3600):
-                rt.history._data[ch].append((ts, v))
+            rt.history.seed(ch, store.history(dev.name, ch, now - rt.history.keep))
         for r in readings:
             rt.latest[r.channel] = r
             rt.history.add(r, now)
+        readings = [*readings, *rt.add_computed(now)]
         print(_table(
             [[r.channel, r.format_value(), r.status or "", _age(r.age()), r.source] for r in readings],
             ["channel", "value", "status", "age", "source"],
         ))
         print()
-        ctx = Context(now=now, readings=rt.latest, history=rt.history)
+        ctx = rt.context(now)
+        if rt.steady is not None:
+            print(f"steady state: {'yes' if ctx.steady_ready else 'no - ' + ctx.steady_detail}\n")
         rows = []
         for rule in rt.rules:
             if rule.rule_id in saved:  # before check(): hysteresis depends on the firing state
                 rule.state = RuleState.from_dict(saved[rule.rule_id])
-            v = rule.check(ctx)
-            cond = {True: "TRIGGERED", False: "ok", None: "no data"}[v.active]
+            paused = rule.opts.steady_only and not ctx.steady_ready
+            v = Verdict(None, detail=f"waits for steady state ({ctx.steady_detail})") if paused else rule.check(ctx)
+            cond = "paused" if paused else {True: "TRIGGERED", False: "ok", None: "no data"}[v.active]
             rows.append([rule.name, rule.opts.severity.label, cond, rule.status_text(), v.detail])
         if rows:
             print(_table(rows, ["rule", "severity", "condition now", "state", "detail"]))

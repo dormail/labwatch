@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import ssl
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -86,6 +87,31 @@ DEFAULT_CHANNELS: dict[str, ChannelSpec] = {
         ChannelSpec("cpa_high_pressure", "driver.cpa.high_pressure"),
         ChannelSpec("cpa_low_pressure", "driver.cpa.low_pressure"),
         ChannelSpec("status_text", "general.status.status"),
+        ChannelSpec("cpa_motor_current", "driver.cpa.motor_current", "A"),
+        # Computed: a growing in/out difference means too little water flows through the compressor.
+        ChannelSpec("cooling_water_dT", "= cooling_water_out - cooling_water_in", "K",
+                    expr="cooling_water_out - cooling_water_in"),
+        # Gas handling pumps (onOffError). "ghs_compressor" is the gas-handling compressor,
+        # not the pulse tube compressor ("compressor").
+        ChannelSpec("scroll1", "mapper.bf.pumps.scroll1", labels=ON_OFF_ERROR),
+        ChannelSpec("scroll2", "mapper.bf.pumps.scroll2", labels=ON_OFF_ERROR),
+        ChannelSpec("turbo1", "mapper.bf.pumps.turbo1", labels=ON_OFF_ERROR),
+        ChannelSpec("turbo2", "mapper.bf.pumps.turbo2", labels=ON_OFF_ERROR),
+        ChannelSpec("ghs_compressor", "mapper.bf.pumps.compressor", labels=ON_OFF_ERROR),
+        # Pfeiffer TC400 turbo controllers, if the control software has them (driver.tc400,
+        # driver.tc4002). Systems without them simply report these channels as not available.
+        *(
+            spec
+            for tc in ("tc400", "tc4002")
+            for spec in (
+                ChannelSpec(f"{tc}_speed", f"driver.{tc}.active_rotational_speed", "Hz"),
+                ChannelSpec(f"{tc}_power", f"driver.{tc}.drive_power", "W"),
+                ChannelSpec(f"{tc}_at_speed", f"driver.{tc}.setting_speed_attained", labels=((0, "no"), (1, "yes"))),
+                ChannelSpec(f"{tc}_overtemp", f"driver.{tc}.pump_temperature_too_high", labels=((0, "no"), (1, "YES"))),
+                ChannelSpec(f"{tc}_driver_overtemp", f"driver.{tc}.driver_temperature_too_high",
+                            labels=((0, "no"), (1, "YES"))),
+            )
+        ),
     ]
 }
 
@@ -186,21 +212,36 @@ FSE_CHANNELS: dict[str, ChannelSpec] = {
 
 STATUS_SECTIONS = [
     ("Temperatures", ("T50K", "T4K", "Tstill", "TMXC", "T_FSE")),
-    ("Cryostat", ("pulse_tube", "compressor", "flow", "cooling_water_in", "cooling_water_out", "cpa_alarm_text",
-                  "cpa_warning_text")),
+    ("Pulse tube", ("pulse_tube", "compressor", "cpa_alarm_text", "cpa_warning_text", "cpa_helium", "cpa_oil",
+                    "cpa_high_pressure", "cpa_low_pressure", "cpa_motor_current")),
+    ("Cooling water", ("cooling_water_in", "cooling_water_out", "cooling_water_dT")),
+    ("Circulation", ("flow", "scroll1", "scroll2", "turbo1", "turbo2", "ghs_compressor",
+                     "tc400_speed", "tc400_power", "tc4002_speed", "tc4002_power")),
     ("Pressures", ("P1", "P2", "P3", "P4", "P5", "P6")),
     ("FSE", tuple(n for n in FSE_CHANNELS if n != "T_FSE")),
     ("", ("status_text",)),
 ]
 
+# "Cold and circulating, settled for 6 h": anomaly rules only learn and alert then,
+# so cooldowns, condensing and warm-ups are excluded.
+BLUEFORS_STEADY_STATE = {
+    "conditions": [{"channel": "T4K", "below": 4.5}, {"channel": "Tstill", "below": 1.5}],
+    "for": "6h",
+}
+
 # Channels shown in every alert message, to give the full picture at a glance.
 SUMMARY_CHANNELS = ("T50K", "T4K", "Tstill", "TMXC", "pulse_tube", "compressor", "flow", "cooling_water_in")
+
+
+class ValueNotFound(DeviceError):
+    """The API has no value at this path (error 3001): this system lacks that feature."""
 
 
 @register("bluefors")
 class BlueforsDevice(Device):
     summary_channels = SUMMARY_CHANNELS
     overview_channels = ("T4K", "TMXC", "pulse_tube")
+    default_steady_state = BLUEFORS_STEADY_STATE
 
     @property
     def status_sections(self) -> list[tuple[str, tuple[str, ...]]]:
@@ -230,6 +271,7 @@ class BlueforsDevice(Device):
             headers={"User-Agent": "labwatch"},
         )
         self._missing_logged: set[str] = set()
+        self._missing_until: dict[str, float] = {}  # source -> monotonic time to probe again
 
     @classmethod
     def from_config(cls, name: str, cfg: dict[str, Any]) -> BlueforsDevice:
@@ -277,6 +319,8 @@ class BlueforsDevice(Device):
             body = None
         if resp.status_code == 403:
             raise DeviceError(f"{self.name}: API key rejected ({_api_error(body) or 'HTTP 403'})")
+        if isinstance(body, dict) and isinstance(body.get("error"), dict) and body["error"].get("code") == 3001:
+            raise ValueNotFound(f"{self.name}: {path}: {_api_error(body)}")
         if resp.status_code >= 400 or not isinstance(body, dict) or "data" not in body:
             raise DeviceError(f"{self.name}: {path}: {_api_error(body) or f'HTTP {resp.status_code}'}")
         return body["data"] or {}
@@ -284,37 +328,59 @@ class BlueforsDevice(Device):
     async def describe(self) -> dict[str, Any]:
         return await self._get("/system/")
 
-    async def _read_channel(self, spec: ChannelSpec, sem: asyncio.Semaphore) -> Reading:
+    def _not_found(self, spec: ChannelSpec) -> Reading:
+        return Reading(self.name, spec.name, spec.source, None, None, spec.unit, status="NOT_FOUND")
+
+    async def _read_channel(self, spec: ChannelSpec, sem: asyncio.Semaphore) -> tuple[Reading, bool]:
+        """Returns (reading, value_does_not_exist)."""
+        if self._missing_until.get(spec.source, 0) > time.monotonic():
+            return self._not_found(spec), True
         async with sem:
             try:
                 data = await self._get("/values/" + spec.source.replace(".", "/"), recursion=0)
             except DeviceUnreachable:
                 raise
+            except ValueNotFound as e:
+                if spec.source not in self._missing_logged:
+                    self._missing_logged.add(spec.source)
+                    log.info("%s: channel %s (%s) not available on this system: %s",
+                             self.name, spec.name, spec.source, e)
+                return self._not_found(spec), True
             except DeviceError as e:
                 if "API key" in str(e):
                     raise
                 if spec.source not in self._missing_logged:
                     self._missing_logged.add(spec.source)
                     log.warning("%s: channel %s (%s) unavailable: %s", self.name, spec.name, spec.source, e)
-                return Reading(self.name, spec.name, spec.source, None, None, spec.unit, status="NOT_FOUND")
-        return node_to_reading(self.name, spec, data.get(spec.source))
+                return self._not_found(spec), False
+        self._missing_logged.discard(spec.source)
+        return node_to_reading(self.name, spec, data.get(spec.source)), False
 
     async def poll(self) -> list[Reading]:
         sem = asyncio.Semaphore(8)
-        results = await asyncio.gather(
-            *(self._read_channel(spec, sem) for spec in self.channels.values()),
-            return_exceptions=True,
-        )
+        specs = [s for s in self.channels.values() if not s.computed]
+        results = await asyncio.gather(*(self._read_channel(s, sem) for s in specs), return_exceptions=True)
         readings: list[Reading] = []
-        for r in results:
+        missing: list[str] = []
+        for spec, r in zip(specs, results):
             if isinstance(r, DeviceError):
                 raise r  # unreachable or bad key: the whole poll failed
             if isinstance(r, BaseException):
                 raise DeviceError(f"{self.name}: unexpected error: {type(r).__name__}") from r
-            readings.append(r)
+            reading, absent = r
+            readings.append(reading)
+            if absent:
+                missing.append(spec.source)
         if readings and all(r.status == "NOT_FOUND" for r in readings):
             raise DeviceError(f"{self.name}: none of the {len(readings)} channels could be read "
                               "(control software not ready?)")
+        # Values this system doesn't have (e.g. no FSE / turbo controller): ask again in 30 min.
+        # Only trusted when other values were readable, i.e. the value tree is up.
+        until = time.monotonic() + 1800
+        for source in missing:
+            self._missing_until.setdefault(source, until)
+            if self._missing_until[source] <= time.monotonic():
+                self._missing_until[source] = until
         return readings
 
     async def discover(self, prefix: str = "") -> list[DiscoveredValue]:

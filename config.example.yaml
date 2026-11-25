@@ -75,8 +75,10 @@ notifiers:
 # ---------------------------------------------------------------------------
 # Devices. For Bluefors fridges a standard set of channels is built in:
 #   T50K T4K Tstill TMXC(mK) P1..P6 flow pulse_tube compressor cpa_alarm(_text)
-#   cpa_warning(_text) cooling_water_in/out cpa_oil cpa_helium
+#   cpa_warning(_text) cooling_water_in/out/dT cpa_oil cpa_helium cpa_motor_current
 #   cpa_high_pressure cpa_low_pressure status_text
+#   scroll1 scroll2 turbo1 turbo2 ghs_compressor
+#   tc400_* / tc4002_* (speed, power, at_speed, overtemp, driver_overtemp) if present
 # Add more with `channels:` (find paths with: labwatch discover <device> [prefix]),
 # remove defaults with `exclude_channels: [...]`.
 # ---------------------------------------------------------------------------
@@ -91,8 +93,13 @@ devices:
     verify_tls: false
     poll_interval: 30
     unreachable_after: 5m         # alert if the API can't be reached this long
-    # channels:
+    # fse: true                   # fridge has a Bluefors FSE: read and show its status
+    # channels:                   # extra channels: a path from `labwatch discover`, or a computed expr
     #   still_heater_power: {path: mapper.heater_mappings_bftc.device.c.power, unit: W}
+    #   p_ratio: {expr: "P3 / P4"}
+    # steady_state:               # when anomaly rules learn/alert (this is the built-in default)
+    #   conditions: [{channel: T4K, below: 4.5}, {channel: Tstill, below: 1.5}]
+    #   for: 6h
 
     rules: &bluefors_rules
       # --- pulse tube / compressor: what a power or cooling-water failure trips first
@@ -133,12 +140,58 @@ devices:
         above: 70                 # K
         hysteresis: 2
         severity: warning
-      # - channel: TMXC
-      #   above: 100              # mK; only if you don't run experiments above this
-      #   severity: warning
-      # - channel: flow
-      #   below: 0.1              # mmol/s; circulation stopped
-      #   severity: warning
+
+      # --- mixing chamber / still (fast-flux heat spikes are short; `for` ignores them)
+      - channel: TMXC
+        above: 50                 # mK
+        hysteresis: 5
+        for: 30m                  # must stay above for 30 min (resets when it drops back)
+        severity: warning
+      - channel: Tstill
+        above: 1.2                # K
+        for: 15m
+        severity: warning
+
+      # --- gas handling pumps (0 = off, 1 = on, 2 = error)
+      - {channel: scroll1, equals: 2, severity: critical, auto_arm: false}
+      - {channel: scroll2, equals: 2, severity: critical, auto_arm: false}
+      - {channel: turbo1, equals: 2, severity: critical, auto_arm: false}
+      - {channel: turbo2, equals: 2, severity: critical, auto_arm: false}
+      - {channel: ghs_compressor, equals: 2, severity: critical, auto_arm: false}
+      # "stopped": arms only after the pump ran for arm_after, so normally-off pumps never alarm
+      - {channel: scroll1, not_equals: 1, severity: warning, message: Circulation scroll pump stopped.}
+      - {channel: turbo1, not_equals: 1, severity: warning, message: Circulation turbo pump stopped.}
+
+      # --- turbo controllers (Pfeiffer TC400; ignored on systems that don't expose them)
+      - {channel: tc400_overtemp, equals: 1, name: tc400 turbo too hot, severity: warning, auto_arm: false}
+      - {channel: tc400_driver_overtemp, equals: 1, name: tc400 controller too hot, severity: warning, auto_arm: false}
+      - {channel: tc400_at_speed, not_equals: 1, name: tc400 turbo not at full speed, for: 5m, severity: warning}
+      - {channel: tc4002_overtemp, equals: 1, name: tc4002 turbo too hot, severity: warning, auto_arm: false}
+      - {channel: tc4002_driver_overtemp, equals: 1, name: tc4002 controller too hot, severity: warning, auto_arm: false}
+      - {channel: tc4002_at_speed, not_equals: 1, name: tc4002 turbo not at full speed, for: 5m, severity: warning}
+
+      # --- cooling water (dT = out - in; rising dT = too little water flow)
+      - channel: cooling_water_out
+        above: 306                # K (~33 C)
+        severity: warning
+      - channel: cooling_water_dT
+        above: 15                 # K
+        severity: warning
+        message: Cooling water flow through the compressor may be too low.
+
+      # --- anomaly detection: "unusual compared to the last 24 h".
+      # Only learns and alerts in the steady state (T4K < 4.5 K and Tstill < 1.5 K for 6 h),
+      # so cooldowns, condensing and warm-ups are excluded. Allowed deviation = the given
+      # value or 4x the channel's own noise, whichever is larger.
+      - &anomaly {channel: cpa_helium, deviation: 5, baseline: 24h, for: 15m, repeat_interval: 0, severity: warning}
+      - {<<: *anomaly, channel: cpa_oil, deviation: 4}                # K
+      - {<<: *anomaly, channel: cpa_high_pressure, deviation: 5%}
+      - {<<: *anomaly, channel: cpa_low_pressure, deviation: 10%}
+      - {<<: *anomaly, channel: cpa_motor_current, deviation: 5%}
+      - {<<: *anomaly, channel: cooling_water_dT, deviation: 3}       # K
+      - {<<: *anomaly, channel: tc400_power, deviation: 25%}
+      - {<<: *anomaly, channel: tc4002_power, deviation: 25%}
+      - {<<: *anomaly, channel: flow, deviation: 15%}
 
       # --- data freshness: the temperature controller stopped updating
       - channel: T4K
