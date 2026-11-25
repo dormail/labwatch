@@ -112,6 +112,9 @@ class Monitor:
         self._device_tasks: list[asyncio.Task] = []
         self._dispatching = 0
         self._known_mutes: dict | None = None
+        # Called after every poll with the engine's clock (bots: re-send alerts when a
+        # personal mute ends). Deterministic, and testable with a fake clock.
+        self.after_poll: list = []
 
     # -- construction ------------------------------------------------------
 
@@ -285,7 +288,13 @@ class Monitor:
             log.exception("%s: computing derived channels failed", rt.name)
         self.store.save_readings(readings, now)
         self.store.device_ok(rt.name, now)
-        return self.evaluate(rt, now)
+        events = self.evaluate(rt, now)
+        for hook in self.after_poll:
+            try:
+                await asyncio.wait_for(hook(now), timeout=20)
+            except Exception:  # noqa: BLE001 - hooks must never disturb monitoring
+                log.exception("after-poll hook %s failed", getattr(hook, "__qualname__", hook))
+        return events
 
     # -- rule evaluation -------------------------------------------------------
 

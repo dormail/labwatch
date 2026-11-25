@@ -109,3 +109,46 @@ def wants(sub: Subscriber, event: AlertEvent, store: StateStore, lifecycle: bool
     now = time.time() if now is None else now
     return not any(mute_matches(m.target, event.device, event.rule_id, event.category)
                    for m in store.personal_mutes(sub.chat_id, now))
+
+
+def firing_events(monitor: Monitor, now: float) -> list[AlertEvent]:
+    """Alerts that are firing right now (and were delivered), as "still firing" reminders."""
+    out = []
+    for rt in monitor.runtimes:
+        for r in rt.all_rules:
+            if r.state.firing and r.state.delivered:
+                out.append(monitor._make_event(rt, r, EventKind.REMINDER, r.state.last_detail, now))
+    return out
+
+
+class MuteWatcher:
+    """Notices when a subscriber's personal mute ends (expired or /unmute) and returns the
+    still-firing alerts that mute was hiding, so that person isn't left in the dark."""
+
+    def __init__(self) -> None:
+        self._known: dict[str, set[str]] = {}
+
+    def released(self, monitor: Monitor, store: StateStore, subs: list[Subscriber], lifecycle: bool = True,
+                 now: float | None = None) -> list[tuple[Subscriber, AlertEvent]]:
+        now = time.time() if now is None else now
+        out: list[tuple[Subscriber, AlertEvent]] = []
+        firing: list[AlertEvent] | None = None
+        global_mutes = None
+        for s in subs:
+            current = {m.target for m in store.personal_mutes(s.chat_id, now)}
+            old = self._known.get(s.chat_id)
+            self._known[s.chat_id] = current
+            gone = (old or set()) - current
+            if old is None or not gone:
+                continue
+            if firing is None:
+                firing = firing_events(monitor, now)
+                global_mutes = store.mutes(now)
+            for ev in firing:
+                if not any(mute_matches(t, ev.device, ev.rule_id, ev.category) for t in gone):
+                    continue
+                if any(m.matches(ev.device, ev.rule_id, ev.category) for m in global_mutes):
+                    continue  # still muted for everyone: the engine sends it when that ends
+                if wants(s, ev, store, lifecycle, now):
+                    out.append((s, ev))
+        return out

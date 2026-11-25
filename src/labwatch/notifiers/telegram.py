@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from labwatch.models import AlertEvent, EventKind, Severity
-from labwatch.notifiers._common import ConfigReader, HttpNotifier, is_urgent
+from labwatch.notifiers._common import ConfigReader, HttpNotifier, fan_out, is_urgent
 from labwatch.notifiers.base import register
 
 DEFAULT_API_BASE = "https://api.telegram.org"
@@ -135,16 +135,12 @@ class TelegramNotifier(HttpNotifier):
         }
 
     async def send(self, event: AlertEvent) -> None:
-        recipients = self.recipients(event)
-        failures: list[Exception] = []
-        for r in recipients:
-            try:
-                await self._send_to(event, r)
-            except Exception as e:  # noqa: BLE001 - one blocked/broken chat must not stop the others
-                failures.append(e)
-                log.warning("telegram: delivery to chat %s failed: %s", r.chat_id, e)
-        if failures and len(failures) == len(recipients):
-            raise failures[0]
+        recipients = list({str(r.chat_id): r for r in self.recipients(event)}.values())  # one per chat
+        errors = await fan_out(recipients, lambda r: self._send_to(event, r))
+        for r, e in errors.items():
+            log.warning("telegram: delivery to chat %s failed: %s", r.chat_id, e)
+        if recipients and len(errors) == len(recipients):
+            raise next(iter(errors.values()))
 
     async def _send_to(self, event: AlertEvent, recipient: Recipient) -> None:
         url = f"{self.api_base}/bot{self._bot_token}/sendMessage"

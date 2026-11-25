@@ -81,6 +81,10 @@ class DiscordCommandBot:
         self.guilds: set[str] = set()
         self._seq: int | None = None
         self._acked = True
+        self._transport = transport
+        self._handlers: set[asyncio.Task] = set()
+        self._mute_watcher = subscriptions.MuteWatcher()
+        monitor.after_poll.append(self.deliver_released)
         self._bootstrap()
         notifier.recipients_fn = self.recipients_for
 
@@ -202,7 +206,8 @@ class DiscordCommandBot:
         if name in ("mute", "unmute", "level") and sub is None:
             return "This channel doesn't receive labwatch alerts, so there's nothing to mute here.", True
         if name == "mute":
-            tokens = (options.get("what") or "all").split()
+            # Default: this channel's machine (not "*", which would also hide labwatch's own news).
+            tokens = (options.get("what") or here_device or "all").split()
             target, rest, err = subscriptions.parse_target(self.monitor, tokens)
             if err:
                 return f"{err}. Try `all`, a device, or an alarm type: {', '.join(subscriptions.categories(self.monitor))}", True
@@ -212,8 +217,8 @@ class DiscordCommandBot:
             seconds = subscriptions.parse_duration(dur) if dur else subscriptions.DEFAULT_MUTE
             until = None if seconds is None else now + seconds
             self.store.personal_mute(sid, target, until)
-            label = f"all {here_device} alerts" if target == "*" and here_device else (
-                "all alerts" if target == "*" else f"**{target}** alerts")
+            label = (f"all **{target}** alerts" if here_device and target.lower() == here_device.lower()
+                     else "all alerts" if target == "*" else f"**{target}** alerts")
             return f"🔕 **{user}** muted {label} in this channel {fmt_until(until)}. `/unmute` to undo.", False
         if name == "unmute":
             what = (options.get("what") or "all").strip()
@@ -262,8 +267,8 @@ class DiscordCommandBot:
     async def handle_interaction(self, d: dict[str, Any]) -> None:
         if d.get("type") != 2:  # APPLICATION_COMMAND
             return
-        if d.get("guild_id") and self.guilds and str(d["guild_id"]) not in self.guilds:
-            return
+        if str(d.get("guild_id") or "") not in self.guilds:
+            return  # only our own server(s); never DMs
         data = d.get("data") or {}
         options = {o["name"]: str(o.get("value", "")) for o in data.get("options") or []}
         member = d.get("member") or {}
@@ -312,7 +317,9 @@ class DiscordCommandBot:
                 if op == 0 and msg.get("t") == "READY":
                     log.info("Discord commands active in %d server(s)", len(self.guilds))
                 elif op == 0 and msg.get("t") == "INTERACTION_CREATE":
-                    asyncio.create_task(self._safe(self.handle_interaction(msg["d"])))
+                    t = asyncio.create_task(self._safe(self.handle_interaction(msg["d"])))
+                    self._handlers.add(t)
+                    t.add_done_callback(self._handlers.discard)
                 elif op == 1:
                     await ws.send(json.dumps({"op": 1, "d": self._seq}))
                 elif op == 11:
@@ -332,7 +339,22 @@ class DiscordCommandBot:
         except Exception:  # noqa: BLE001
             log.exception("Discord: handling an interaction failed")
 
+    async def deliver_released(self, now: float | None = None) -> int:
+        """Post the still-firing alerts a channel's just-ended /mute was hiding."""
+        subs = [s for s in self.store.subscribers() if s.chat_id.startswith("discord:")]
+        sent = 0
+        for s, ev in self._mute_watcher.released(self.monitor, self.store, subs, self.n.lifecycle, now):
+            try:
+                await self.n.post_to([s.chat_id.split(":", 1)[1]], ev)
+                sent += 1
+            except Exception as e:  # noqa: BLE001
+                log.warning("Discord: re-sending %s to %s failed: %s", ev.title, s.chat_id, e)
+        return sent
+
     async def run(self) -> None:
+        if self._client.is_closed:  # restarted by the supervisor after a crash
+            self._client = httpx.AsyncClient(base_url=self.n.api_base, headers=self.n.headers,
+                                             timeout=20, transport=self._transport)
         if self._connect is None:
             from websockets.asyncio.client import connect
 

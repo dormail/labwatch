@@ -32,3 +32,11 @@ def restore_logging():
     root.setLevel(level)
     for name, lvl in others.items():
         logging.getLogger(name).setLevel(lvl)
+
+
+@pytest.fixture(autouse=True)
+def fast_fan_out_retry(monkeypatch):
+    """Notifiers retry failed recipients after 3 s; don't wait for that in tests."""
+    import labwatch.notifiers._common as common
+
+    monkeypatch.setattr(common, "FAN_OUT_RETRY_AFTER", 0.0)

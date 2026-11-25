@@ -28,6 +28,41 @@ class DeliveryError(RuntimeError):
     """A notifier could not deliver an event (message is safe to log)."""
 
 
+FAN_OUT_RETRY_AFTER = 3.0  # seconds before retrying the recipients that failed
+
+
+async def fan_out(targets: list, send_one, *, retry_after: float | None = None, budget: float = 24.0) -> dict:
+    """Send to all targets *concurrently*; retry only the failed ones once if time allows.
+
+    Returns {target: exception} for targets that still failed. Concurrency matters: with
+    sequential sends, a slow API would mean the people at the end of the list never get
+    the alert before the dispatcher's timeout.
+    """
+    import asyncio
+    import time
+
+    retry_after = FAN_OUT_RETRY_AFTER if retry_after is None else retry_after
+    start = time.monotonic()
+    pending = list(dict.fromkeys(targets))  # dedupe, keep order
+    errors: dict = {}
+    for attempt in range(2):
+        results = await asyncio.gather(*(send_one(t) for t in pending), return_exceptions=True)
+        failed = []
+        for t, r in zip(pending, results):
+            if isinstance(r, asyncio.CancelledError):
+                raise r
+            if isinstance(r, BaseException):
+                errors[t] = r
+                failed.append(t)
+            else:
+                errors.pop(t, None)
+        if not failed or attempt == 1 or time.monotonic() - start + retry_after > budget:
+            break
+        await asyncio.sleep(retry_after)
+        pending = failed
+    return errors
+
+
 def is_urgent(event: AlertEvent) -> bool:
     """A critical alert that is (still) firing: the case that should wake someone up."""
     return (

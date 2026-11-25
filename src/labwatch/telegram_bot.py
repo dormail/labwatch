@@ -68,8 +68,11 @@ class TelegramCommandBot:
         self.api_base = api_base.rstrip("/")
         self.poll_timeout = poll_timeout
         self.notifier = notifier
+        self._transport = transport
         self._client = httpx.AsyncClient(timeout=poll_timeout + 15, transport=transport)
         self._pending_replied: dict[str, float] = {}
+        self._mute_watcher = subscriptions.MuteWatcher()
+        monitor.after_poll.append(self.deliver_released)
         self._bootstrap()
 
     @classmethod
@@ -100,15 +103,22 @@ class TelegramCommandBot:
         now = time.time()
         out = []
         lifecycle = n.lifecycle if n is not None else True
+        crit = str(n.critical_chat_id) if n is not None and n.critical_chat_id else None
+        seen: set[str] = set()
         for s in self.store.subscribers():
             if s.chat_id.startswith("discord:"):
                 continue  # Discord channels are served by the Discord bot
+            if crit and s.chat_id == crit:
+                continue  # only gets the admin's urgent alerts (routed below), nothing else
             if not subscriptions.wants(s, event, self.store, lifecycle, now):
                 continue
             chat: str | int = s.chat_id
             if n is not None and n.critical_chat_id and str(s.chat_id) == str(n.chat_id) and is_urgent(event):
                 chat = n.critical_chat_id
             silent = n.is_silent(event) if n is not None else event.severity < Severity.CRITICAL
+            if str(chat) in seen:
+                continue
+            seen.add(str(chat))
             out.append(Recipient(chat, silent))
         return out
 
@@ -277,6 +287,8 @@ class TelegramCommandBot:
         duration: float | None = subscriptions.DEFAULT_MUTE
         if rest and is_duration(rest[0]):
             duration = subscriptions.parse_duration(rest.pop(0))
+        elif everyone:
+            return "Mutes for everyone need a duration, e.g. /muteall Flash 2d warm-up (max 14 days)."
         until = None if duration is None else now + duration
         if everyone:
             if until is None or duration > subscriptions.MAX_GLOBAL_MUTE:
@@ -308,15 +320,19 @@ class TelegramCommandBot:
             rows = []
             for role in ("admin", "user", "pending"):
                 for s in self.store.subscribers((role,)):
+                    if s.chat_id.startswith("discord:"):
+                        continue
                     rows.append(f"{'👑' if role == 'admin' else '⏳' if role == 'pending' else '👤'} "
                                 f"{html.escape(s.name or '?')} – <code>{s.chat_id}</code> – {role}, {s.level}")
             return "\n".join(rows) or "No users."
         if not args:
             return f"Usage: /{cmd} &lt;chat id&gt; (see /users)"
         s = self.store.subscriber(args[0])
-        if s is None:
+        if s is None or s.chat_id.startswith("discord:"):
             return f"No user with chat id {html.escape(args[0])}. See /users"
         if cmd == "approve":
+            if s.role == "admin":
+                return f"{html.escape(s.name or s.chat_id)} is already an admin."
             self.store.upsert_subscriber(s.chat_id, s.name, "user", s.level)
             self._to_notify.append((s.chat_id, "✅ You now receive labwatch alerts. /help shows what you can do, "
                                                "/level and /mute let you choose what you get."))
@@ -377,7 +393,27 @@ class TelegramCommandBot:
 
     # -- main loop -----------------------------------------------------------------
 
+    async def deliver_released(self, now: float | None = None) -> int:
+        """Send people the still-firing alerts their just-ended personal mute was hiding."""
+        n = self.notifier
+        if n is None:
+            return 0
+        from labwatch.notifiers.telegram import Recipient
+
+        subs = [s for s in self.store.subscribers() if not s.chat_id.startswith("discord:")]
+        sent = 0
+        for s, ev in self._mute_watcher.released(self.monitor, self.store, subs, n.lifecycle, now):
+            chat = n.critical_chat_id if (n.critical_chat_id and s.chat_id == str(n.chat_id) and is_urgent(ev)) else s.chat_id
+            try:
+                await n._send_to(ev, Recipient(chat, n.is_silent(ev)))
+                sent += 1
+            except Exception as e:  # noqa: BLE001
+                log.warning("Telegram: re-sending %s to %s failed: %s", ev.title, s.chat_id, e)
+        return sent
+
     async def run(self) -> None:
+        if self._client.is_closed:  # restarted by the supervisor after a crash
+            self._client = httpx.AsyncClient(timeout=self.poll_timeout + 15, transport=self._transport)
         delay = 5.0
         offset: int | None = None
         try:
@@ -392,7 +428,9 @@ class TelegramCommandBot:
                         "offset": offset, "timeout": self.poll_timeout, "allowed_updates": ["message"],
                     })
                     delay = 5.0
-                except TelegramAPIError as e:
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001 - TelegramAPIError, or anything unexpected
                     # 409 = another labwatch (or bot) is polling the same token.
                     log.warning("Telegram commands: %s (retrying in %.0fs)", e, delay)
                     await asyncio.sleep(delay)

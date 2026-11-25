@@ -23,7 +23,7 @@ from typing import Any, Callable
 
 from labwatch import __version__
 from labwatch.models import AlertEvent, Severity
-from labwatch.notifiers._common import ConfigReader, HttpNotifier
+from labwatch.notifiers._common import ConfigReader, HttpNotifier, fan_out
 from labwatch.notifiers.base import register
 from labwatch.notifiers.discord import _MENTION_EVERYONE, _MENTION_ROLE, _MENTION_USER, build_message
 
@@ -120,14 +120,14 @@ class DiscordBotNotifier(HttpNotifier):
         return self.default_channels(event)
 
     async def send(self, event: AlertEvent) -> None:
-        targets = self.recipients(event)
-        failures: list[Exception] = []
+        await self.post_to(self.recipients(event), event)
+
+    async def post_to(self, channels: list[str], event: AlertEvent) -> None:
+        targets = list(dict.fromkeys(channels))
         payload = build_message(event, self.mention)
-        for cid in targets:
-            try:
-                await self._post(f"{self.api_base}/channels/{cid}/messages", json=payload, headers=self.headers)
-            except Exception as e:  # noqa: BLE001 - one broken channel must not stop the others
-                failures.append(e)
-                log.warning("discord: posting to channel %s failed: %s", cid, e)
-        if failures and len(failures) == len(targets):
-            raise failures[0]
+        errors = await fan_out(targets, lambda cid: self._post(
+            f"{self.api_base}/channels/{cid}/messages", json=payload, headers=self.headers))
+        for cid, e in errors.items():
+            log.warning("discord: posting to channel %s failed: %s", cid, e)
+        if targets and len(errors) == len(targets):
+            raise next(iter(errors.values()))
