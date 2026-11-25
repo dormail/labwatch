@@ -5,6 +5,18 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
+
+
+def parse_duration(v: Any) -> float:
+    """Seconds from a number or a string like '90s', '5m', '2h', '1d'."""
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().lower()
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if s and s[-1] in mult:
+        return float(s[:-1]) * mult[s[-1]]
+    return float(s)
 
 
 def utcnow() -> datetime:
@@ -51,6 +63,7 @@ class Reading:
     raw: str | None = None
     status: str | None = None
     outdated: bool = False
+    label: str | None = None  # human-readable state for enumerations, e.g. "on"/"off"
 
     @property
     def valid(self) -> bool:
@@ -63,7 +76,11 @@ class Reading:
         return ((now or utcnow()) - self.timestamp).total_seconds()
 
     def format_value(self) -> str:
+        if self.label is not None:
+            return self.label
         if self.value is None:
+            if self.raw is not None and self.status not in {"INVALID", "NOT_FOUND"}:
+                return self.raw.strip() or "-"  # text channel
             return f"invalid ({self.status or 'n/a'})"
         return format_quantity(self.value, self.unit)
 
@@ -71,6 +88,8 @@ class Reading:
 def format_quantity(value: float | None, unit: str | None = None) -> str:
     if value is None:
         return "n/a"
+    if value == 0:
+        value = 0.0  # avoid "-0"
     a = abs(value)
     if a != 0 and (a < 1e-3 or a >= 1e5):
         s = f"{value:.3e}"

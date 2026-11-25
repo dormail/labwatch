@@ -1,0 +1,158 @@
+# labwatch example configuration.
+#
+#   cp config.example.yaml config.yaml      # config.yaml is git-ignored
+#   cp .env.example .env                     # secrets go here, also git-ignored
+#
+# Secrets (API keys, webhook URLs, tokens, passwords) never go into this file
+# directly: write ${VARIABLE} and define VARIABLE in .env or the environment.
+# Durations accept seconds or strings like 90s, 5m, 2h, 1d.
+
+state_db: labwatch.sqlite        # relative to this file
+history_days: 30                 # keep reading history for a future dashboard
+notify_startup: true             # "labwatch started/stopped" info messages
+daily_summary: "09:00"           # daily "all OK" message (info severity); remove to disable
+
+# Dead man's switch: labwatch pings this URL every `interval` while it is healthy.
+# If the monitoring PC loses power or labwatch crashes, the pings stop and the
+# service (e.g. https://healthchecks.io, free) alerts you. Strongly recommended:
+# a power outage can take down the monitoring machine too.
+heartbeat:
+  url: ${HEARTBEAT_URL:-}
+  interval: 60
+
+# Defaults for every rule (each rule can override them).
+rule_defaults:
+  for: 60                # condition must hold this long before alerting
+  clear_for: 120         # ... and be healthy this long before "resolved"
+  auto_arm: true         # rules only activate after being healthy for arm_after
+  arm_after: 10m         #   -> no alarm spam while a fridge is warm / cooling down
+  repeat_interval: 2h    # reminder while still firing (0 = never)
+
+# ---------------------------------------------------------------------------
+# Where alerts go. Each notifier receives events with severity >= min_severity
+# (info < warning < critical). Remove or set `enabled: false` on unused ones.
+# Try them with:  labwatch test-notify [name] [--severity critical]
+# ---------------------------------------------------------------------------
+notifiers:
+  - name: console
+    type: console
+
+  - name: discord
+    type: discord
+    webhook_url: ${DISCORD_WEBHOOK_URL}
+    min_severity: info            # the "log" channel: everything incl. daily summary
+    mention: "@here"              # pinged on critical alerts only (or "<@USER_ID>", "<@&ROLE_ID>")
+
+  - name: telegram
+    type: telegram
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+    chat_id: ${TELEGRAM_CHAT_ID}
+    critical_chat_id: ${TELEGRAM_CRITICAL_CHAT_ID:-}  # optional: give this chat a loud custom sound
+    silent_below: critical        # warnings arrive silently, critical ones ring
+    min_severity: warning
+
+  - name: phone
+    type: ntfy                    # https://ntfy.sh push app; urgent priority can bypass Do-Not-Disturb on Android
+    topic: ${NTFY_TOPIC}          # pick a long random topic name - it works like a password
+    min_severity: critical
+    enabled: false
+
+  - name: email
+    type: email
+    smtp_host: smtp.example.org
+    smtp_port: 587
+    security: starttls            # starttls | ssl | none
+    username: ${SMTP_USER:-}
+    password: ${SMTP_PASSWORD:-}
+    from: labwatch@example.org
+    to: [you@example.org]
+    min_severity: critical
+    enabled: false
+
+# ---------------------------------------------------------------------------
+# Devices. For Bluefors fridges a standard set of channels is built in:
+#   T50K T4K Tstill TMXC(mK) P1..P6 flow pulse_tube compressor cpa_alarm(_text)
+#   cpa_warning(_text) cooling_water_in/out cpa_oil cpa_helium
+#   cpa_high_pressure cpa_low_pressure status_text
+# Add more with `channels:` (find paths with: labwatch discover <device> [prefix]),
+# remove defaults with `exclude_channels: [...]`.
+# ---------------------------------------------------------------------------
+devices:
+  - name: Flash
+    type: bluefors
+    host: ${FLASH_HOST}           # IP/hostname of the PC running the Bluefors control software
+    api_key: ${FLASH_API_KEY}     # create a READ-ONLY key in the control software
+    port: 49098
+    # The control software uses a self-signed certificate. false = don't verify.
+    # Better: pin the certificate (see README):  verify_tls: certs/flash.pem
+    verify_tls: false
+    poll_interval: 30
+    unreachable_after: 5m         # alert if the API can't be reached this long
+    # channels:
+    #   still_heater_power: {path: mapper.heater_mappings_bftc.device.c.power, unit: W}
+
+    rules: &bluefors_rules
+      # --- pulse tube / compressor: what a power or cooling-water failure trips first
+      - channel: pulse_tube
+        not_equals: 1             # 0 = off, 1 = on, 2 = error
+        severity: critical
+        message: Pulse tube is not running! Check power, compressor, cooling water.
+      - channel: compressor
+        not_equals: 1             # 1 = running
+        severity: critical
+        message: Compressor stopped. Check power, cooling water, compressor display.
+      - channel: cpa_alarm
+        not_equals: 0
+        severity: critical
+        detail_channel: cpa_alarm_text
+        for: 0
+      - channel: cpa_warning
+        not_equals: 0
+        severity: warning
+        detail_channel: cpa_warning_text
+      - channel: cooling_water_in
+        above: 298                # K (~25 C); typical Cryomech inlet limit ~27 C
+        severity: warning
+        message: Cooling water is getting warm - the compressor will trip if it keeps rising.
+
+      # --- temperatures (adjust to your fridge's normal values)
+      - channel: T4K
+        above: 5                  # K
+        hysteresis: 0.3
+        severity: critical
+      - channel: T4K
+        rate_above: 0.05          # K/min, early warning of a warm-up
+        window: 10m
+        severity: warning
+      - channel: T50K
+        above: 70                 # K
+        hysteresis: 2
+        severity: warning
+      # - channel: TMXC
+      #   above: 100              # mK; only if you don't run experiments above this
+      #   severity: warning
+      # - channel: flow
+      #   below: 0.1              # mmol/s; circulation stopped
+      #   severity: warning
+
+      # --- data freshness: the temperature controller stopped updating
+      - channel: T4K
+        max_age: 20m
+        severity: warning
+
+  # More fridges reuse the same rules via the YAML anchor:
+  # - name: Mercury
+  #   type: bluefors
+  #   host: ${MERCURY_HOST}
+  #   api_key: ${MERCURY_API_KEY}
+  #   rules: *bluefors_rules
+
+  # A fake fridge to try notifications end-to-end: the "power fails" after 2 min.
+  - name: Simfridge
+    type: simulated
+    scenario: power_outage        # stable | power_outage | power_outage_pc | unreachable
+    outage_after: 2m
+    poll_interval: 5
+    rule_defaults_note: uses the same rules
+    rules: *bluefors_rules
+    enabled: false

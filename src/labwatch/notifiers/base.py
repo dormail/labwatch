@@ -82,7 +82,10 @@ def build_notifier(cfg: dict[str, Any]) -> Notifier:
         known = ", ".join(sorted(_REGISTRY)) or "(none)"
         raise NotifierConfigError(f"unknown notifier type {type_name!r}; known: {known}")
     name = cfg.pop("name", type_name)
-    min_severity = Severity.parse(cfg.pop("min_severity", "warning"))
+    try:
+        min_severity = Severity.parse(cfg.pop("min_severity", "warning"))
+    except ValueError as e:
+        raise NotifierConfigError(f"{type_name} notifier {name!r}: 'min_severity': {e}") from None
     return cls.from_config(name, min_severity, cfg)
 
 
