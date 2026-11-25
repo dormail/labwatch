@@ -219,12 +219,23 @@ A power outage can take down the network and the monitoring machine together wit
 - `daily_summary: "09:00"` sends a short daily "all OK" message. If it doesn't arrive,
   something is wrong.
 
-Linux (systemd), see `deploy/labwatch.service`:
+**Linux server (recommended):** `deploy/install.sh` sets up a sandboxed systemd service.
 
 ```bash
-sudo cp deploy/labwatch.service /etc/systemd/system/ && sudo systemctl enable --now labwatch
-journalctl -u labwatch -f
+sudo git clone https://github.com/dormail/labwatch /opt/labwatch
+sudo /opt/labwatch/deploy/install.sh [labwatch-backup-<date>.tar.gz]
 ```
+
+| path | contents |
+|---|---|
+| `/opt/labwatch` | code + virtualenv (root-owned) |
+| `/var/lib/labwatch` | `config.yaml`, `.env`, `labwatch.sqlite`; owned by the `labwatch` user, mode 700 |
+| `/usr/local/bin/labwatch` | CLI wrapper, so `labwatch status` and `labwatch mute Flash --for 2h` work for admins |
+
+- It needs Python ≥ 3.10; on Debian/Ubuntu also `python3-venv`.
+- The service starts on boot and restarts itself if it crashes. Logs: `journalctl -u labwatch -f`.
+- After editing the config: `sudo systemctl restart labwatch`.
+- Update: `cd /opt/labwatch && sudo git pull && sudo deploy/install.sh`.
 
 On Windows, run `labwatch run` as a service with [NSSM](https://nssm.cc) or Task Scheduler
 ("At startup", restart on failure).
@@ -242,13 +253,12 @@ Everything site-specific lives in three files next to `config.yaml`:
 ```bash
 # old machine (safe while running; consistent copy of the database)
 labwatch backup                                  # -> labwatch-backup-<date>.tar.gz (secrets inside!)
-scp labwatch-backup-*.tar.gz newhost:/opt/labwatch/
+scp labwatch-backup-*.tar.gz server:
 
-# new machine
-git clone https://github.com/dormail/labwatch /opt/labwatch && cd /opt/labwatch && uv sync
-tar xzf labwatch-backup-*.tar.gz
-uv run labwatch check                            # can it reach the fridges from here?
-# then stop the old instance and start the new one (systemd: see below)
+# Linux server: installs a systemd service, restores the backup, checks the devices, starts it
+sudo git clone https://github.com/dormail/labwatch /opt/labwatch
+sudo /opt/labwatch/deploy/install.sh ~/labwatch-backup-*.tar.gz
+# then stop the old instance:  kill $(cat labwatch.pid)   (or: sudo systemctl stop labwatch)
 ```
 
 Run **only one instance per Telegram bot**. Two instances would send every alert

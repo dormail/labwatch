@@ -1,30 +1,39 @@
-# systemd service for labwatch.
+# systemd service for labwatch. Installed by deploy/install.sh, which fills in
+# the paths if you don't use the defaults below.
 #
-#   sudo cp deploy/labwatch.service /etc/systemd/system/
-#   sudo systemctl edit labwatch      # adjust User= / WorkingDirectory= if needed
-#   sudo systemctl enable --now labwatch
-#   journalctl -u labwatch -f
-#
-# WorkingDirectory must contain config.yaml and .env.
+#   journalctl -u labwatch -f          # logs
+#   sudo systemctl restart labwatch    # after editing /var/lib/labwatch/config.yaml
 
 [Unit]
 Description=labwatch lab equipment monitor
+Documentation=https://github.com/dormail/labwatch
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
 User=labwatch
-WorkingDirectory=/opt/labwatch
-ExecStart=/opt/labwatch/.venv/bin/labwatch run
+Group=labwatch
+WorkingDirectory=/var/lib/labwatch
+ExecStart=/opt/labwatch/.venv/bin/labwatch -c /var/lib/labwatch/config.yaml run
 Restart=always
 RestartSec=10
-# Keep the secrets file private and the service contained.
+# Give the shutdown message ("labwatch stopped") time to reach Telegram.
+TimeoutStopSec=60
+
+# Sandboxing: read-only system, private /tmp, only the data dir is writable.
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/labwatch
+ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/labwatch
+# Only needed for `method: icmp` ping checks if the system ping can't use ICMP sockets:
+# AmbientCapabilities=CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
