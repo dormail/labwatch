@@ -1,0 +1,40 @@
+# --- Secrets & site-specific config: NEVER commit these (public repo!) ---
+.env
+.env.*
+!.env.example
+config.yaml
+config.yml
+!config.example.yaml
+*api*key*
+*API*key*
+*.key
+*.pem
+secrets/
+
+# --- Runtime state ---
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+/state/
+/data/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Editors / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
