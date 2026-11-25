@@ -12,6 +12,8 @@ config.yml
 secrets/
 
 # --- Runtime state ---
+labwatch-backup-*.tar.gz
+*.pid
 *.sqlite
 *.sqlite-*
 *.db

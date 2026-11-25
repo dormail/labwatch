@@ -299,6 +299,52 @@ def cmd_mute(cfg: Config, args) -> int:
     return 0
 
 
+def cmd_backup(cfg: Config, args) -> int:
+    """Bundle config, secrets and state into one tar.gz to move labwatch to another machine."""
+    import os
+    import tarfile
+    import tempfile
+    from pathlib import Path
+
+    out = Path(args.output or f"labwatch-backup-{time.strftime('%Y%m%d-%H%M')}.tar.gz")
+    base = cfg.path.parent
+    files: list[tuple[Path, str]] = [(cfg.path, cfg.path.name)]
+    env = base / ".env"
+    if env.is_file():
+        files.append((env, ".env"))
+    for sec in cfg.devices:  # pinned TLS certificates referenced as relative paths
+        v = sec.cfg.get("verify_tls")
+        if isinstance(v, str) and v.lower() not in ("true", "false"):
+            p = Path(v) if Path(v).is_absolute() else base / v
+            if p.is_file() and not Path(v).is_absolute():
+                files.append((p, v))
+    with tempfile.TemporaryDirectory() as tmp:
+        db_copy = Path(tmp) / "labwatch.sqlite"
+        if cfg.state_db.is_file():
+            store = StateStore(cfg.state_db)
+            store.backup_to(db_copy)
+            store.close()
+            try:
+                arc_db = str(cfg.state_db.relative_to(base))
+            except ValueError:
+                arc_db = cfg.state_db.name
+                print(f"note: state_db is outside the config folder; it is stored as {arc_db}")
+            files.append((db_copy, arc_db))
+        old_umask = os.umask(0o077)  # the archive contains secrets
+        try:
+            with tarfile.open(out, "w:gz") as tar:
+                for src, name in files:
+                    tar.add(src, arcname=name)
+        finally:
+            os.umask(old_umask)
+    print(f"wrote {out} ({out.stat().st_size / 1e6:.1f} MB):")
+    for _, name in files:
+        print(f"  {name}")
+    print("It contains your API keys and tokens - copy it with scp/USB, not by e-mail or chat.")
+    print(f"Restore on the new machine (in the labwatch folder):  tar xzf {out.name}")
+    return 0
+
+
 def cmd_unmute(cfg: Config, args) -> int:
     store = StateStore(cfg.state_db)
     ok = store.unmute(args.target)
@@ -345,6 +391,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("unmute", help="remove a mute")
     s.add_argument("target")
+
+    s = sub.add_parser("backup", help="bundle config, .env and history into a tar.gz (to move machines)")
+    s.add_argument("-o", "--output", help="archive path (default: labwatch-backup-<date>.tar.gz)")
     return p
 
 
@@ -356,6 +405,7 @@ COMMANDS = {
     "status": cmd_status,
     "mute": cmd_mute,
     "unmute": cmd_unmute,
+    "backup": cmd_backup,
 }
 
 

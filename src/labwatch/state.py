@@ -74,7 +74,24 @@ class StateStore:
         self.db.commit()
 
     def close(self) -> None:
+        self.checkpoint()
         self.db.close()
+
+    def checkpoint(self) -> None:
+        """Fold the write-ahead log into the main file (so copying labwatch.sqlite is enough)."""
+        if self.path != ":memory:":
+            try:
+                self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+
+    def backup_to(self, dest: str | Path) -> None:
+        """Consistent copy of the database, safe while the monitor is running."""
+        target = sqlite3.connect(str(dest))
+        try:
+            self.db.backup(target)
+        finally:
+            target.close()
 
     # -- readings ---------------------------------------------------------
 

@@ -211,6 +211,7 @@ class Monitor:
             except Exception:  # noqa: BLE001
                 log.exception("failed to flush %s", ev.title)
         self._save_state()
+        self.store.checkpoint()
         for rt in self.runtimes:
             await rt.device.aclose()
         for n in self.notifiers:
@@ -445,6 +446,7 @@ class Monitor:
         while True:
             try:
                 self.store.prune(self.config.history_days)
+                self.store.checkpoint()
             except Exception:  # noqa: BLE001
                 log.exception("pruning the state database failed")
             await asyncio.sleep(3600)

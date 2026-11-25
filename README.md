@@ -37,6 +37,7 @@ Other commands:
 | `labwatch status` | latest readings, rule states, mutes and recent events (from the running monitor) |
 | `labwatch mute Flash --for 6h -r "warm-up"` | silence a device (or a rule: `"Flash/T4K above 5 K"`, or everything: `"*"`) |
 | `labwatch unmute Flash` | remove the mute |
+| `labwatch backup` | bundle config, `.env` and history into one archive (to move machines) |
 
 ## How alerts work
 
@@ -227,6 +228,31 @@ journalctl -u labwatch -f
 
 On Windows, run `labwatch run` as a service with [NSSM](https://nssm.cc) or Task Scheduler
 ("At startup", restart on failure).
+
+## Moving labwatch to another machine
+
+Everything site-specific lives in three files next to `config.yaml`:
+
+| file | contents | without it |
+|---|---|---|
+| `config.yaml` | devices, rules, notifiers | start over from `config.example.yaml` |
+| `.env` | API keys, bot token, webhook URLs | recreate the keys |
+| `labwatch.sqlite` | reading history, armed/firing state, mutes, event log | rules re-arm after 10 min; anomaly detection re-learns (~12 h) |
+
+```bash
+# old machine (safe while running; consistent copy of the database)
+labwatch backup                                  # -> labwatch-backup-<date>.tar.gz (secrets inside!)
+scp labwatch-backup-*.tar.gz newhost:/opt/labwatch/
+
+# new machine
+git clone https://github.com/dormail/labwatch /opt/labwatch && cd /opt/labwatch && uv sync
+tar xzf labwatch-backup-*.tar.gz
+uv run labwatch check                            # can it reach the fridges from here?
+# then stop the old instance and start the new one (systemd: see below)
+```
+
+Run **only one instance per Telegram bot**. Two instances would send every alert
+twice and compete for the bot's commands.
 
 ## Security
 
