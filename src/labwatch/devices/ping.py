@@ -42,6 +42,11 @@ CHANNELS = {
 @register("ping")
 class PingDevice(Device):
     summary_channels = ("reachable", "rtt_ms")
+    overview_channels = ("reachable", "rtt_ms")
+
+    @property
+    def status_sections(self) -> list[tuple[str, tuple[str, ...]]]:
+        return [("Network", ("reachable", "rtt_ms"))]
 
     def __init__(
         self,
@@ -94,9 +99,13 @@ class PingDevice(Device):
         else:
             cmd = ["ping", "-c", "1", "-W", str(max(1, round(self.timeout))), self.host]
         t0 = time.perf_counter()
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+        except OSError as e:
+            self.last_error = f"cannot run ping: {type(e).__name__}"
+            return None
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=self.timeout + 2)
         except asyncio.TimeoutError:

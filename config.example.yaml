@@ -98,10 +98,12 @@ devices:
       # --- pulse tube / compressor: what a power or cooling-water failure trips first
       - channel: pulse_tube
         not_equals: 1             # 0 = off, 1 = on, 2 = error
+        on_invalid: alarm         # an unreadable value is an alarm too
         severity: critical
         message: Pulse tube is not running! Check power, compressor, cooling water.
       - channel: compressor
         not_equals: 1             # 1 = running
+        on_invalid: alarm         # compressor controller lost (e.g. it lost power) is an alarm too
         severity: critical
         message: Compressor stopped. Check power, cooling water, compressor display.
       - channel: cpa_alarm

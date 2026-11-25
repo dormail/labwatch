@@ -84,10 +84,12 @@ class Expander:
             return val
 
         out = _VAR.sub(repl, s)
-        # A value that is *only* a variable reference gets number/bool typing ("30" -> 30).
-        if _VAR.fullmatch(s):
+        # A value that is *only* a variable reference gets number/bool typing ("30" -> 30),
+        # unless it's a secret or the conversion would change it ("007" stays a string).
+        m = _VAR.fullmatch(s)
+        if m and not any(h in m.group(1).upper() for h in _SECRET_HINTS):
             if re.fullmatch(r"[+-]?\d+", out):
-                return int(out)
+                return int(out) if str(int(out)) == out.lstrip("+") else out
             if re.fullmatch(r"[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?", out):
                 return float(out)
             if out.lower() in ("true", "false"):
@@ -156,11 +158,11 @@ def load_config(path: str | Path | None = None) -> Config:
     def section(cfg: Any, what: str) -> Section | None:
         if not isinstance(cfg, dict):
             raise ConfigError(f"{path}: each {what} entry must be a mapping, got {cfg!r}")
-        if cfg.get("enabled", True) is False:
-            return None
         ex = Expander()
         expanded = ex.expand(cfg)
-        expanded.pop("enabled", None)
+        enabled = expanded.pop("enabled", True)
+        if enabled is False or (isinstance(enabled, str) and enabled.strip().lower() in ("false", "no", "0", "off")):
+            return None
         secrets.update(ex.secrets)
         return Section(expanded, ex.missing)
 

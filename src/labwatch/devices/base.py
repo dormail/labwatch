@@ -69,6 +69,12 @@ class DiscoveredValue:
 class Device(abc.ABC):
     type_name: str = ""
     summary_channels: tuple[str, ...] = ()  # shown as context in alert messages
+    overview_channels: tuple[str, ...] = ()  # one-line overview (e.g. Telegram /status)
+
+    @property
+    def status_sections(self) -> list[tuple[str, tuple[str, ...]]]:
+        """(heading, channels) groups for a detailed status report."""
+        return [("", self.summary_channels or tuple(self.channels))]
 
     def __init__(
         self,

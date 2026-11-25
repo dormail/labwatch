@@ -21,7 +21,7 @@ import time
 from typing import Any
 
 from labwatch.devices.base import ChannelSpec, Device, DeviceUnreachable, register
-from labwatch.devices.bluefors import DEFAULT_CHANNELS, SUMMARY_CHANNELS
+from labwatch.devices.bluefors import DEFAULT_CHANNELS, STATUS_SECTIONS, SUMMARY_CHANNELS
 from labwatch.models import Reading, parse_duration, utcnow
 
 BASE = {
@@ -52,6 +52,12 @@ BASE = {
 @register("simulated")
 class SimulatedDevice(Device):
     summary_channels = SUMMARY_CHANNELS
+    overview_channels = ("T4K", "TMXC", "pulse_tube")
+
+    @property
+    def status_sections(self) -> list[tuple[str, tuple[str, ...]]]:
+        return [(title, tuple(c for c in chans if c in self.channels)) for title, chans in STATUS_SECTIONS]
+
     def __init__(
         self,
         name: str,

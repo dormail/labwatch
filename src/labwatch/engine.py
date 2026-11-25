@@ -18,6 +18,7 @@ from labwatch.rules import (
     Context,
     History,
     Rule,
+    RuleConfigError,
     RuleState,
     Transition,
     UnreachableRule,
@@ -108,6 +109,7 @@ class Monitor:
 
     def _restore_state(self) -> None:
         saved = self.store.load_rule_states()
+        devices = self.store.devices()
         since = time.time() - 3600
         for rt in self.runtimes:
             for rule in rt.all_rules:
@@ -115,10 +117,17 @@ class Monitor:
                     rule.state = RuleState.from_dict(saved[rule.rule_id])
                     if not rule.opts.auto_arm:
                         rule.state.armed = True
+            # Remember when the device last answered, so a restart during an outage
+            # doesn't look like a recovery (false "RESOLVED unreachable").
+            dev = devices.get(rt.name)
+            if dev is not None and dev["last_success"] is not None:
+                rt.unreachable.last_success = dev["last_success"]
             # Seed history so rate rules work right after a restart.
             for ch in rt.device.channels:
+                dq = rt.history._data[ch]
                 for ts, value in self.store.history(rt.name, ch, since):
-                    rt.history._data[ch].append((ts, value))
+                    if not dq or ts > dq[-1][0]:  # the table has one row per poll; dedupe
+                        dq.append((ts, value))
 
     def _save_state(self) -> None:
         self.store.save_rule_states(
@@ -141,6 +150,8 @@ class Monitor:
         if self.config.daily_summary:
             self._tasks.append(asyncio.create_task(self._daily_summary_loop(), name="summary"))
         self._tasks.append(asyncio.create_task(self._maintenance_loop(), name="maintenance"))
+        for bot in self.command_bots():
+            self._tasks.append(asyncio.create_task(bot.run(), name="telegram-commands"))
 
         if self.config.notify_startup:
             names = ", ".join(f"{rt.name} ({len(rt.rules)} rules)" for rt in self.runtimes)
@@ -150,6 +161,18 @@ class Monitor:
             await asyncio.gather(*self._tasks)
         finally:
             await self.shutdown()
+
+    def command_bots(self) -> list:
+        """Telegram command listeners for Telegram notifiers with ``commands: true`` (one per bot)."""
+        from labwatch.notifiers.telegram import TelegramNotifier
+        from labwatch.telegram_bot import TelegramCommandBot
+
+        bots, seen = [], set()
+        for n in self.notifiers:
+            if isinstance(n, TelegramNotifier) and n.commands and n._bot_token not in seen:
+                seen.add(n._bot_token)
+                bots.append(TelegramCommandBot.from_notifier(self, n))
+        return bots
 
     async def shutdown(self) -> None:
         for t in self._tasks:
@@ -192,7 +215,10 @@ class Monitor:
         """Poll one device, evaluate its rules and queue notifications."""
         try:
             readings = await rt.device.poll()
-        except DeviceError as e:
+        except (DeviceError, Exception) as e:  # noqa: BLE001 - a crashing driver must still alert
+            if not isinstance(e, DeviceError):
+                log.exception("%s: driver crashed while polling", rt.name)
+                e = DeviceError(f"unexpected error in the {rt.device.type_name} driver: {type(e).__name__}")
             now = time.time()
             if rt.last_poll_ok is not False:
                 log.warning("%s: poll failed: %s", rt.name, e)
@@ -410,6 +436,7 @@ def build_runtime(config: Config, sec) -> DeviceRuntime:
     unreach_cfg = {
         "severity": sec.cfg.get("unreachable_severity", "critical"),
         "auto_arm": False,
+        "for": 0,  # unreachable_after already is the debounce
         "clear_for": 0,
         "message": sec.cfg.get(
             "unreachable_message",
@@ -418,6 +445,12 @@ def build_runtime(config: Config, sec) -> DeviceRuntime:
         ),
     }
     unreachable = UnreachableRule(device.name, device.unreachable_after, build_options(unreach_cfg, config.rule_defaults))
+    for r in rules:
+        if r.rule_id == unreachable.rule_id:
+            raise RuleConfigError(
+                f"device {device.name!r}: rule name 'unreachable' is reserved for the built-in "
+                "connection rule; pick another name"
+            )
     return DeviceRuntime(device=device, rules=rules, unreachable=unreachable)
 
 

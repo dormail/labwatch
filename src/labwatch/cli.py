@@ -151,10 +151,10 @@ def cmd_check(cfg: Config, args) -> int:
         ctx = Context(now=now, readings=rt.latest, history=rt.history)
         rows = []
         for rule in rt.rules:
+            if rule.rule_id in saved:  # before check(): hysteresis depends on the firing state
+                rule.state = RuleState.from_dict(saved[rule.rule_id])
             v = rule.check(ctx)
             cond = {True: "TRIGGERED", False: "ok", None: "no data"}[v.active]
-            if rule.rule_id in saved:
-                rule.state = RuleState.from_dict(saved[rule.rule_id])
             rows.append([rule.name, rule.opts.severity.label, cond, rule.status_text(), v.detail])
         if rows:
             print(_table(rows, ["rule", "severity", "condition now", "state", "detail"]))

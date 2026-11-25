@@ -17,7 +17,9 @@ class TelegramNotifier(HttpNotifier):
     """Config: ``bot_token`` (required, secret), ``chat_id`` (required),
     ``critical_chat_id`` (optional: critical firing/reminder events go there
     instead), ``silent_below`` (severity, default "critical": less severe events
-    are delivered without sound; resolved/info always silent), ``api_base``."""
+    are delivered without sound; resolved/info always silent), ``api_base``,
+    ``commands`` (default true: answer /status etc., see labwatch.telegram_bot),
+    ``allowed_chat_ids`` (extra chats allowed to use commands)."""
 
     def __init__(
         self,
@@ -29,6 +31,8 @@ class TelegramNotifier(HttpNotifier):
         critical_chat_id: str | int | None = None,
         silent_below: Severity = Severity.CRITICAL,
         api_base: str = DEFAULT_API_BASE,
+        commands: bool = True,
+        allowed_chat_ids: list[str] | None = None,
         **http: Any,
     ) -> None:
         super().__init__(name, min_severity, **http)
@@ -37,6 +41,8 @@ class TelegramNotifier(HttpNotifier):
         self.critical_chat_id = critical_chat_id
         self.silent_below = silent_below
         self.api_base = api_base.rstrip("/")
+        self.commands = commands
+        self.allowed_chat_ids = list(allowed_chat_ids or [])
 
     @classmethod
     def from_config(
@@ -52,6 +58,13 @@ class TelegramNotifier(HttpNotifier):
         critical_chat_id = r.string("critical_chat_id")
         silent_below = r.severity("silent_below", Severity.CRITICAL)
         api_base = r.url("api_base") or DEFAULT_API_BASE
+        commands = r.boolean("commands", True)
+        r.used.add("allowed_chat_ids")
+        allowed = cfg.get("allowed_chat_ids") or []
+        if isinstance(allowed, (str, int)):
+            allowed = [allowed]
+        if not isinstance(allowed, list):
+            raise r.error("'allowed_chat_ids' must be a chat id or a list of chat ids")
         r.finish()
         return cls(
             name,
@@ -61,6 +74,8 @@ class TelegramNotifier(HttpNotifier):
             critical_chat_id=critical_chat_id,
             silent_below=silent_below,
             api_base=api_base,
+            commands=commands,
+            allowed_chat_ids=[str(a) for a in allowed],
             **http,
         )
 

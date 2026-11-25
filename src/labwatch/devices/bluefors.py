@@ -163,6 +163,36 @@ def _api_error(body: Any) -> str | None:
     return None
 
 
+YES_NO = ((0, "no"), (1, "yes"))
+OK_FAILED = ((0, "ok"), (1, "FAILED"))
+VALVE = ((0, "closed"), (1, "open"))
+
+# Bluefors FSE (fast sample exchange), enabled per device with `fse: true`.
+FSE_CHANNELS: dict[str, ChannelSpec] = {
+    spec.name: spec
+    for spec in [
+        ChannelSpec("T_FSE", "mapper.bf.temperatures.tfse", "K"),
+        ChannelSpec("fse_probe_in", "driver.fse.port.in", labels=YES_NO),
+        ChannelSpec("fse_probe_out", "driver.fse.port.out", labels=YES_NO),
+        ChannelSpec("fse_position", "driver.fse.position", "m"),
+        ChannelSpec("fse_probe_mounted", "driver.fse.port.probe_mounted", labels=YES_NO),
+        ChannelSpec("fse_gate_valve", "driver.fse.gate_valve", labels=VALVE),
+        ChannelSpec("fse_pump_valve", "driver.fse.pump_valve", labels=VALVE),
+        ChannelSpec("fse_vacuum", "driver.fse.port.vacuum", labels=YES_NO),
+        ChannelSpec("fse_status", "driver.fse.status.failed", labels=OK_FAILED),
+        ChannelSpec("fse_motor_error", "driver.fse.motor.error", labels=YES_NO),
+    ]
+}
+
+STATUS_SECTIONS = [
+    ("Temperatures", ("T50K", "T4K", "Tstill", "TMXC", "T_FSE")),
+    ("Cryostat", ("pulse_tube", "compressor", "flow", "cooling_water_in", "cooling_water_out", "cpa_alarm_text",
+                  "cpa_warning_text")),
+    ("Pressures", ("P1", "P2", "P3", "P4", "P5", "P6")),
+    ("FSE", tuple(n for n in FSE_CHANNELS if n != "T_FSE")),
+    ("", ("status_text",)),
+]
+
 # Channels shown in every alert message, to give the full picture at a glance.
 SUMMARY_CHANNELS = ("T50K", "T4K", "Tstill", "TMXC", "pulse_tube", "compressor", "flow", "cooling_water_in")
 
@@ -170,6 +200,11 @@ SUMMARY_CHANNELS = ("T50K", "T4K", "Tstill", "TMXC", "pulse_tube", "compressor",
 @register("bluefors")
 class BlueforsDevice(Device):
     summary_channels = SUMMARY_CHANNELS
+    overview_channels = ("T4K", "TMXC", "pulse_tube")
+
+    @property
+    def status_sections(self) -> list[tuple[str, tuple[str, ...]]]:
+        return [(title, tuple(c for c in chans if c in self.channels)) for title, chans in STATUS_SECTIONS]
     def __init__(
         self,
         name: str,
@@ -211,7 +246,9 @@ class BlueforsDevice(Device):
             name=name,
             host=str(host),
             api_key=str(key),
-            channels=parse_channels(name, cfg, DEFAULT_CHANNELS),
+            channels=parse_channels(
+                name, cfg, {**DEFAULT_CHANNELS, **(FSE_CHANNELS if cfg.get("fse") else {})}
+            ),
             port=int(cfg.get("port", DEFAULT_PORT)),
             verify_tls=cfg.get("verify_tls", False),
             timeout=parse_duration(cfg.get("timeout", 10.0)),
@@ -275,6 +312,9 @@ class BlueforsDevice(Device):
             if isinstance(r, BaseException):
                 raise DeviceError(f"{self.name}: unexpected error: {type(r).__name__}") from r
             readings.append(r)
+        if readings and all(r.status == "NOT_FOUND" for r in readings):
+            raise DeviceError(f"{self.name}: none of the {len(readings)} channels could be read "
+                              "(control software not ready?)")
         return readings
 
     async def discover(self, prefix: str = "") -> list[DiscoveredValue]:

@@ -136,6 +136,7 @@ class RuleOptions:
     repeat_interval: float = 3600.0
     message: str = ""  # extra text for humans, e.g. what to check
     detail_channel: str | None = None  # append this channel's text (e.g. alarm text)
+    on_invalid: str = "ignore"  # "alarm": an unreadable value (DISCONNECTED, INVALID) counts as a problem
 
 
 class Rule(abc.ABC):
@@ -163,6 +164,12 @@ class Rule(abc.ABC):
     def _reading(self, ctx: Context) -> Reading | None:
         r = ctx.readings.get(self.channel)
         return r
+
+    def _invalid(self, r: Reading | None) -> Verdict:
+        """Verdict for a missing/unreadable value: no data, or an alarm with ``on_invalid: alarm``."""
+        if r is not None and self.opts.on_invalid == "alarm":
+            return Verdict(True, None, f"{self.channel} unreadable ({r.status or 'no value'})")
+        return Verdict(None)
 
     @property
     def title(self) -> str:
@@ -253,7 +260,7 @@ class ThresholdRule(Rule):
     def check(self, ctx: Context) -> Verdict:
         r = self._reading(ctx)
         if r is None or r.value is None:
-            return Verdict(None)
+            return self._invalid(r)
         h = self.hysteresis if self.state.firing else 0.0
         x = r.value
         active = (self.above is not None and x > self.above - h) or (self.below is not None and x < self.below + h)
@@ -322,7 +329,7 @@ class StateRule(Rule):
     def check(self, ctx: Context) -> Verdict:
         r = self._reading(ctx)
         if r is None or r.value is None:
-            return Verdict(None)
+            return self._invalid(r)
         x = r.value
         active = (bool(self.equals) and x in self.equals) or (bool(self.not_equals) and x not in self.not_equals)
         return Verdict(active, x, f"{self.channel} = {r.format_value()}")
@@ -362,6 +369,14 @@ class UnreachableRule(Rule):
         return f"unreachable for {self.after / 60:g} min"
 
     def check(self, ctx: Context) -> Verdict:
+        if self.last_success is None and self.state.firing:
+            # Restarted while the alert was firing and no successful poll since: still down.
+            ref = self.started
+            if ref is None:
+                return Verdict(None)
+            return Verdict(True, ctx.now - ref, f"still unreachable (no successful poll since labwatch "
+                                                f"restarted {(ctx.now - ref) / 60:.1f} min ago)"
+                                                + (f"; last error: {self.last_error}" if self.last_error else ""))
         ref = self.last_success if self.last_success is not None else self.started
         if ref is None:
             return Verdict(None)
@@ -390,6 +405,7 @@ def _as_float_set(v: Any) -> set[float]:
 
 _OPTION_KEYS = {
     "severity", "for", "clear_for", "auto_arm", "arm_after", "repeat_interval", "message", "detail_channel",
+    "on_invalid",
 }
 _KIND_KEYS = {
     "threshold": {"above", "below", "hysteresis"},
@@ -420,6 +436,9 @@ def build_options(cfg: dict[str, Any], defaults: dict[str, Any]) -> RuleOptions:
         o.arm_after = parse_duration(merged["arm_after"])
     if "repeat_interval" in merged:
         o.repeat_interval = parse_duration(merged["repeat_interval"])
+    o.on_invalid = str(merged.get("on_invalid", "ignore")).lower()
+    if o.on_invalid not in ("ignore", "alarm"):
+        raise ValueError(f"on_invalid must be 'ignore' or 'alarm', got {o.on_invalid!r}")
     o.message = str(merged.get("message") or "")
     o.detail_channel = merged.get("detail_channel")
     return o
@@ -445,9 +464,9 @@ def build_rule(device: str, cfg: dict[str, Any], defaults: dict[str, Any], chann
         raise RuleConfigError(f"{where}: unknown keys {sorted(unknown)}")
     spec = channel_specs[channel]
     unit = getattr(spec, "unit", None)
-    opts = build_options(cfg, defaults)
     name = cfg.get("name")
     try:
+        opts = build_options(cfg, defaults)
         if kind == "threshold":
             return ThresholdRule(device, channel, name, opts, cfg.get("above"), cfg.get("below"),
                                  cfg.get("hysteresis", 0.0), unit)
