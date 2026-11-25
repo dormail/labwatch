@@ -168,6 +168,18 @@ Notifications). On iOS, allow Telegram in your Focus modes. Telegram doesn't sup
 "Critical Alerts", so a phone on silent may stay silent. Keep a second channel (e.g. ntfy)
 for the alerts that must wake you.
 
+**Commands:** while `labwatch run` is running, the bot also answers commands. Type `/`
+in the chat to see the menu:
+
+| command | answer |
+|---|---|
+| `/status` | one line per device: OK / alerts, key temperatures, data age |
+| `/flash`, `/ket`, `/plassys`, … | details: temperatures, pulse tube, compressor, pressures, FSE (with `fse: true`), armed alarms, mutes |
+| `/alerts` | active alerts |
+
+Only the configured chats (`chat_id`, `critical_chat_id`, `allowed_chat_ids`) get answers.
+Anyone can find a bot by name, so other chats are ignored. Turn this off with `commands: false`.
+
 ### Discord
 
 You need no bot or developer account, only a **channel webhook** on a server where you
