@@ -28,6 +28,26 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "run as root (sudo $0 $*)"
 [[ -f "$CODE_DIR/pyproject.toml" ]] || die "$CODE_DIR doesn't look like a labwatch checkout"
+
+# The service is sandboxed (ProtectHome=true) and can't read home directories, so a
+# checkout in ~/ is copied to /opt/labwatch and the install continues from there.
+if [[ "$CODE_DIR" == /home/* || "$CODE_DIR" == /root/* ]]; then
+  TARGET=${INSTALL_DIR:-/opt/labwatch}
+  say "the service can't run code from a home directory; using a copy in $TARGET"
+  if [[ -e "$TARGET" && ! -d "$TARGET/.git" ]]; then
+    die "$TARGET exists but is not a labwatch git checkout - move it away first"
+  fi
+  if [[ -d "$TARGET/.git" ]]; then
+    git -C "$TARGET" pull --quiet --ff-only "$CODE_DIR" HEAD
+  else
+    git clone --quiet "$CODE_DIR" "$TARGET"
+    origin=$(git -C "$CODE_DIR" remote get-url origin 2>/dev/null || true)
+    [[ -n "$origin" ]] && git -C "$TARGET" remote set-url origin "$origin"
+  fi
+  [[ -n "$BACKUP" ]] && BACKUP=$(realpath "$BACKUP")
+  exec env DATA_DIR="$DATA_DIR" SERVICE_USER="$SERVICE_USER" PYTHON="$PYTHON" SYSTEMCTL="$SYSTEMCTL" \
+    UNIT_DIR="$UNIT_DIR" BIN_DIR="$BIN_DIR" NO_START="${NO_START:-0}" "$TARGET/deploy/install.sh" ${BACKUP:+"$BACKUP"}
+fi
 [[ -z "$BACKUP" || -f "$BACKUP" ]] || die "backup file $BACKUP not found"
 command -v "$PYTHON" >/dev/null || die "$PYTHON not found (install python3 >= 3.10, plus python3-venv on Debian/Ubuntu)"
 "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
